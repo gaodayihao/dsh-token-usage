@@ -4,7 +4,7 @@
 
 ### Added
 
-- Token 用量统计面板（Session Gallery / Codex 个人用量页风格）：
+- Token 用量统计面板（Codex 个人用量页风格）：
   - 用户区：头像（emoji / 本地图片，localStorage 持久化）+ 可编辑昵称 + 数据范围副标题
   - 5 指标栏：累计 / 单会话峰值 Token、最长聊天时长、当前 / 最长连续天数
   - Token 活动热力图：每日（GitHub 贡献图）/ 每周（柱状）/ 累计（SVG 折线）三视图

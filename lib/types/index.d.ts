@@ -1,7 +1,7 @@
 /**
- * Token 统计面板 — Host 半边（Session Gallery 风格）
+ * Token 统计面板 — Host 半边（Codex 风格）
  *
- * 仿照 OpenClaw Session Gallery 统计面板（Codex 个人用量页风格）的数据口径，
+ * 仿照 Codex 个人用量页统计面板的数据口径，
  * 后端逻辑完全基于 DSH 原生数据：
  *  - Backfill：激活时通过 `ctx.sessionPersistence.list()/inspect()` 枚举每个持久化
  *    session，从存储事件折叠 usage / 工具调用 / 消息时间线，面板覆盖历史。

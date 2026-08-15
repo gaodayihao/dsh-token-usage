@@ -18,7 +18,7 @@ export interface ThinkingLevelCounts {
     low: number;
     off: number;
 }
-/** getStats 快照：一次调用返回的全量聚合（Session Gallery / Codex 个人用量页口径）。 */
+/** getStats 快照：一次调用返回的全量聚合（Codex 个人用量页口径）。 */
 export interface TokenUsageSnapshot {
     /** 有历史记录的会话总数。 */
     totalConversations: number;
