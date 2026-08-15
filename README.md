@@ -14,8 +14,8 @@ DSH 刚发布，大家最关心的就是：**我的 Token 到底花哪去了？*
 
 这个插件在 DSH Web 界面里加一个 Token 用量统计面板，把当前运行实例**全部会话**的 token 消耗汇总，点击入口即弹出居中面板（深色 / 浅色主题）：
 
-![面板（深色主题）](./docs/screenshot-panel-dark.png)
 ![面板（浅色主题）](./docs/screenshot-panel-light.png)
+![面板（深色主题）](./docs/screenshot-panel-dark.png)
 
 ## 特性
 

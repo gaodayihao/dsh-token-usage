@@ -14,8 +14,8 @@ DSH just launched, and the first thing everyone wants to know is: **where did my
 
 This plugin adds a token-usage stats panel to the DSH web UI, aggregating token consumption across **all sessions** of the running instance. Click any entry point to open the centered panel (dark / light theme):
 
-![Panel (dark theme)](./docs/screenshot-panel-dark.png)
 ![Panel (light theme)](./docs/screenshot-panel-light.png)
+![Panel (dark theme)](./docs/screenshot-panel-dark.png)
 
 ## Features
 

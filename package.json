@@ -1,7 +1,7 @@
 {
   "name": "dsh-token-usage",
   "version": "0.1.0",
-  "description": "DSH Token usage stats panel (Session Gallery style): whole-instance token consumption summary + activity heatmap. DSH Token 用量统计面板。",
+  "description": "DSH Token 用量统计面板（Session Gallery 风格）：全实例 Token 消耗汇总 + 活动热力图。",
   "type": "module",
   "main": "lib/types/index.js",
   "types": "lib/types/index.d.ts",
