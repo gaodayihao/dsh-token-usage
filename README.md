@@ -13,7 +13,7 @@
 
 DSH 刚发布，大家最关心的是：**我的 Token 到底烧哪去了？**
 
-这个插件在 DSH Web 界面里加一个**Token 用量统计面板**（右下角弹出），把当前运行实例**全部会话**的 token 消耗汇总成 Codex 个人用量页那种一目了然的样子：
+这个插件在 DSH Web 界面里加一个**Token 用量统计面板**，把当前运行实例**全部会话**的 token 消耗汇总成 Codex 个人用量页那种一目了然的样子，点击入口即弹出居中面板：
 
 ![面板（每日视图）](./docs/screenshot-panel.png)
 ![面板（累计视图）](./docs/screenshot-panel-cumulative.png)
@@ -25,8 +25,8 @@ DSH 刚发布，大家最关心的是：**我的 Token 到底烧哪去了？**
 - **活动洞察**：推理强度分布、Skill 使用、消息/工具统计
 - **插件 / Skill Top5**：谁在消耗最多，一目了然
 - **两个原生入口**（与 DSH UI 融为一体）：
-  - 侧边栏底部「Token 统计」按钮
-  - 会话头部实时用量胶囊：`⚡ 2.15亿`（每 5 秒刷新，随时盯着数字跳）
+  - 侧边栏底部「Token 统计」按钮（与设置对齐，应用级常驻）
+  - 会话头部实时用量胶囊：`⚡ 2.15亿`（每 5 秒自动刷新数字）
 - **深空紫双主题**：跟随系统 / 手动切换；浅色深色都好看
 - **零 DSH 源码改动**：浏览器半边走通用 RPC 通道，安装即用
 
@@ -40,49 +40,41 @@ DSH 刚发布，大家最关心的是：**我的 Token 到底烧哪去了？**
 
 ## 安装
 
-> ⚠️ **现状说明**：DSH 刚发布（第 3 天），其运行时包（`@deepseek-ai/*`）尚未发布到 npm，因此本插件的依赖由 DSH 安装提供（peerDependencies）。以下是当前可用的安装方式；等 DSH 官方包上 npm 后可直接 `npm i dsh-token-usage`。
+装完记得重启 `dsh web` 并刷新页面。
 
-### 方式 A：放进 DSH 仓库工作区（推荐，开发/尝鲜最顺）
+### 一句话安装（推荐）：让 Agent 自己装
 
-```sh
-# 1. 克隆 DSH 仓库并安装依赖（如果还没做）
-git clone https://github.com/deepseek-ai/deepseek-harness
-cd deepseek-harness && pnpm install
+把下面这句话发给你的 DSH Agent（替换 `<仓库路径>` 为克隆下来的路径）：
 
-# 2. 把本仓库拷进 packages/extensions/ 并构建
-git clone https://github.com/<you>/dsh-token-usage
-cp -R dsh-token-usage packages/extensions/
-pnpm install          # 链接新 workspace 包
-pnpm run build:lib    # 构建全部（含本插件）
+> 把 dsh-token-usage 插件（源码在 `<仓库路径>`）安装为 DSH 正式插件：构建 lib、把包挂进 web profile 的 dsh.profile.bundles、重启 dsh web，然后验证面板出现。
 
-# 3. 在 web profile 挂上 bundle
-#    ~/.dsh/profiles/web/package.json:
-#      "dependencies": { "dsh-token-usage": "workspace:^" }
-#      "dsh": { "profile": { "bundles": [..., "dsh-token-usage"] } }
+Agent 会读取本 README 完成构建、挂载与重启。
 
-# 4. 重启 dsh web，刷新页面
-```
-
-### 方式 B：独立目录 + profile 链接（不动 DSH 源码）
+### 手动方式 A：放进 DSH 仓库（最顺）
 
 ```sh
-# 克隆到任意位置
-git clone https://github.com/<you>/dsh-token-usage
-
-# 挂进 web profile 的依赖并安装
-cd ~/.dsh/profiles/web
-pnpm add file:/path/to/dsh-token-usage
-# 并把 "dsh-token-usage" 追加进 dsh.profile.bundles
-# 重启 dsh web
+git clone https://github.com/deepseek-ai/deepseek-harness && cd deepseek-harness && pnpm install
+git clone <本仓库地址> && cp -R dsh-token-usage packages/extensions/
+pnpm install && pnpm run build:lib
+# ~/.dsh/profiles/web/package.json: dependencies 加 "dsh-token-usage": "workspace:^"
+#                              dsh.profile.bundles 加 "dsh-token-usage"
 ```
 
-> `@deepseek-ai/*` peer 依赖会从 DSH 安装的 node_modules 解析；若你的 DSH 以源码方式运行（推荐），workspace 链接自动满足。
+### 手动方式 B：独立目录 + profile 链接（不动 DSH 源码）
+
+```sh
+git clone <本仓库地址>
+cd ~/.dsh/profiles/web && pnpm add file:<克隆路径>
+# dsh.profile.bundles 加 "dsh-token-usage"
+```
+
+> 插件运行所需的 `@deepseek-ai/*` 依赖由 DSH 安装提供（peerDependencies），无需单独安装。
 
 ## 使用
 
 1. 重启 `dsh web` 后，**左侧栏底部**出现「Token 统计」入口
 2. 打开任意会话，**标题旁**出现实时用量胶囊 `⚡ 2.15亿`
-3. 点击任一入口打开面板；右上角可切主题、关闭
+3. 点击任一入口打开居中面板；右上角可切主题、关闭
 4. 面板内热力图支持三视图切换 + 悬浮看单日/单周/累计数值
 
 数据每 5 秒刷新；历史会话在插件加载时自动回填，重启不丢。
@@ -130,16 +122,14 @@ pnpm add file:/path/to/dsh-token-usage
 构建链路依赖 DSH 仓库的编译工具（tsc 项目引用 + tsdown + Typert 生成器），因此开发需在 DSH checkout 内进行（方式 A 的目录结构）：
 
 ```sh
-# 改动 src/ 后
+# 浏览器半边改动后（注意：必须先 tsc 再 tsdown）
 pnpm exec tsc -b packages/extensions/dsh-token-stats/tsconfig.client.json
-pnpm exec tsdown --env.DSH_BUILD_FACE client    # 重建浏览器 bundle
-# host 半边改动：
+pnpm exec tsdown --env.DSH_BUILD_FACE client
+# host 半边改动后
 pnpm exec tsc -b packages/extensions/dsh-token-stats/tsconfig.host.json
-pnpm run build:lib:host                          # 重建 host + Typert 产物
+pnpm run build:lib:host
 # 然后重启 dsh web
 ```
-
-> 注意：client 半边必须**先 tsc 再 tsdown**（tsdown 读的是 tsc 产物）。
 
 提交前记得 `pnpm run build:lib` 并提交 `lib/`，让使用者免构建。
 
