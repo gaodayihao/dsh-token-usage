@@ -5,7 +5,7 @@
 **Token usage stats panel for DSH** — Codex usage-page style. See your whole DeepSeek Harness instance's token consumption at a glance: totals / per-session peaks, activity heatmap, top plugins.
 
 ![License](https://img.shields.io/badge/license-MIT-blue.svg)
-![DSH](https://img.shields.io/badge/DSH-web--profile-8b7cf6)
+![DSH Plugin](https://img.shields.io/badge/DSH-Plugin-8b7cf6)
 ![Status](https://img.shields.io/badge/status-beta-yellow)
 
 ## What is this?

@@ -5,7 +5,7 @@
 **DSH 的 Token 用量统计面板** —— 仿 Codex 个人用量页风格，把整个 DSH 实例的 Token 消耗一目了然地展示出来：累计 / 单会话峰值、活动热力图、插件 Top5。
 
 ![License](https://img.shields.io/badge/license-MIT-blue.svg)
-![DSH](https://img.shields.io/badge/DSH-web--profile-8b7cf6)
+![DSH Plugin](https://img.shields.io/badge/DSH-Plugin-8b7cf6)
 ![Status](https://img.shields.io/badge/status-beta-yellow)
 
 ## 这是什么
