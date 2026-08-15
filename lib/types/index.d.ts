@@ -7,7 +7,7 @@
  *    session，从存储事件折叠 usage / 工具调用 / 消息时间线，面板覆盖历史。
  *  - Live：订阅 `session/event`，把同样的信号实时折叠进来。
  *  - RPC：`@Remote('getStats')` 把聚合快照通过 Typert Remote 暴露给浏览器半边
- *    （client 侧 `ctx.remote.tokenStats.getStats()`）。
+ *    （client 侧通过通用 RPC 通道调用 `tokenUsage/getStats`）。
  *
  * 记账语义（与 token-meter 折叠一致）：
  *  - 每 step 一条 usage 记录，键为 `${sessionId}:${turn}:${step}`。
@@ -18,22 +18,22 @@
  * 与 OpenClaw 版的差异：DSH 无火山平台真实总量（GLM）校准，累计 token 直接取
  * provider 返回的 usage（input + output + cacheRead + cacheWrite）；thinking 等级
  * 由 reasoningTokens 近似。
- * @module @deepseek-ai/dsh-token-stats
+ * @module @deepseek-ai/dsh-token-usage
  */
 import { Context, Service } from '@deepseek-ai/cordis';
 import { TypertRemoteService } from '@deepseek-ai/dsh-typert-protocol';
-import type { TokenStatsSnapshot } from './types.ts';
+import type { TokenUsageSnapshot } from './types.ts';
 export type * from './types.ts';
 declare module '@deepseek-ai/cordis' {
     interface Context {
-        tokenStats: TokenStatsService;
+        tokenUsage: TokenUsageService;
     }
 }
 /**
  * 只读统计服务：跨全部持久化 session 聚合 token 用量并实时跟随，通过
  * Typert Remote 暴露给浏览器面板。不创建、不恢复任何 Agent / Session。
  */
-export declare class TokenStatsService extends TypertRemoteService {
+export declare class TokenUsageService extends TypertRemoteService {
     static inject: string[];
     /** stepUsage: key `${sessionId}:${turn}:${step}` -> 折叠后的 usage 记录。 */
     private readonly stepUsage;
@@ -75,7 +75,7 @@ export declare class TokenStatsService extends TypertRemoteService {
      * 读取当前聚合快照。
      * @returns 全部 session 的 token 用量汇总（纯 JSON）。
      */
-    getStats(): TokenStatsSnapshot;
+    getStats(): TokenUsageSnapshot;
 }
-export default TokenStatsService;
+export default TokenUsageService;
 //# sourceMappingURL=index.d.ts.map

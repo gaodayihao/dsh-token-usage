@@ -1,10 +1,10 @@
-/** Package-owned invariant companion. @module dsh-token-usage/invariant */
+/** Package-owned invariant companion. @module @deepseek-ai/dsh-token-usage/invariant */
 
 /* jscpd:ignore-start */
 import type { Context } from '@deepseek-ai/cordis'
 import type { InvariantInstaller } from '@deepseek-ai/dsh-invariants'
 
-const PACKAGE_NAME = 'dsh-token-usage'
+const PACKAGE_NAME = '@deepseek-ai/dsh-token-usage'
 
 /** Cordis companion plugin name. */
 export const name = 'dsh-token-usage-invariant'
@@ -15,7 +15,7 @@ export const inject = ['invariants']
  * No runtime invariant: the service is read-only aggregation over the
  * authoritative session/event stream, and no second authority exists.
  */
-const install: InvariantInstaller = Object.assign(() => {}, { inject: ['tokenStats'] })
+const install: InvariantInstaller = Object.assign(() => {}, { inject: ['tokenUsage'] })
 
 /**
  * Register this package's invariant companion.

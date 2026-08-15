@@ -1,7 +1,7 @@
 {
   "name": "dsh-token-usage",
   "version": "0.1.0",
-  "description": "DSH Token usage stats panel (Session Gallery style): whole-instance token consumption summary + activity heatmap, host aggregation + browser panel. DSH Token 用量统计面板。",
+  "description": "DSH Token usage stats panel (Session Gallery style): whole-instance token consumption summary + activity heatmap. DSH Token 用量统计面板。",
   "type": "module",
   "main": "lib/types/index.js",
   "types": "lib/types/index.d.ts",
@@ -31,7 +31,6 @@
       "default": "./lib/client.js"
     },
     "./cordis.patch.yml": "./cordis.patch.yml",
-    "./src/*": "./src/*",
     "./package.json": "./package.json"
   },
   "files": [
@@ -39,6 +38,9 @@
     "src",
     "cordis.patch.yml",
     "README.md",
+    "README.en.md",
+    "CHANGELOG.md",
+    "docs",
     "LICENSE"
   ],
   "dsh": {

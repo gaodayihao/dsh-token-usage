@@ -1,7 +1,7 @@
-/** Package-owned invariant companion. @module @deepseek-ai/dsh-token-stats/invariant */
+/** Package-owned invariant companion. @module @deepseek-ai/dsh-token-usage/invariant */
 import type { Context } from '@deepseek-ai/cordis';
 /** Cordis companion plugin name. */
-export declare const name = "dsh-token-stats-invariant";
+export declare const name = "dsh-token-usage-invariant";
 /** Services required before the companion can reserve and check package ownership. */
 export declare const inject: string[];
 /**

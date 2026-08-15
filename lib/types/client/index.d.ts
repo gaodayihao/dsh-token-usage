@@ -10,9 +10,9 @@
  *
  * Formal client plugin contract: module exports `inject` + `apply(ctx)`; the
  * loader mounts it into the page's cordis tree and the browser half registers
- * the `shell.overlay` slot. Data comes from the host half's Typert Remote
- * namespace (`ctx.remote.tokenStats.getStats()`).
- * @module @deepseek-ai/dsh-token-stats
+ * the `shell.overlay` slot. Data comes from the host half via the generic RPC
+ * channel (`connection.rpc.call('/api', 'tokenUsage/getStats')`).
+ * @module @deepseek-ai/dsh-token-usage
  */
 import type { ClientContext } from '@deepseek-ai/dsh-client-runtime/client';
 /** Required services: slot registry + the generic RPC channel. */

@@ -7,7 +7,7 @@
  *    session，从存储事件折叠 usage / 工具调用 / 消息时间线，面板覆盖历史。
  *  - Live：订阅 `session/event`，把同样的信号实时折叠进来。
  *  - RPC：`@Remote('getStats')` 把聚合快照通过 Typert Remote 暴露给浏览器半边
- *    （client 侧 `ctx.remote.tokenStats.getStats()`）。
+ *    （client 侧通过通用 RPC 通道调用 `tokenUsage/getStats`）。
  *
  * 记账语义（与 token-meter 折叠一致）：
  *  - 每 step 一条 usage 记录，键为 `${sessionId}:${turn}:${step}`。
@@ -18,20 +18,20 @@
  * 与 OpenClaw 版的差异：DSH 无火山平台真实总量（GLM）校准，累计 token 直接取
  * provider 返回的 usage（input + output + cacheRead + cacheWrite）；thinking 等级
  * 由 reasoningTokens 近似。
- * @module dsh-token-usage
+ * @module @deepseek-ai/dsh-token-usage
  */
 
 import { Context, Service } from '@deepseek-ai/cordis'
 import type { Session, SessionEvent, SessionId } from '@deepseek-ai/dsh-session'
 import type { SessionPersistence } from '@deepseek-ai/dsh-session-persistence'
 import { Remote, TypertRemoteService } from '@deepseek-ai/dsh-typert-protocol'
-import type { ThinkingLevelCounts, TokenStatsSnapshot, TokenUsageFields } from './types.ts'
+import type { ThinkingLevelCounts, TokenUsageSnapshot, TokenUsageFields } from './types.ts'
 
 export type * from './types.ts'
 
 declare module '@deepseek-ai/cordis' {
   interface Context {
-    tokenStats: TokenStatsService
+    tokenUsage: TokenUsageService
   }
 }
 
@@ -40,7 +40,6 @@ const USAGE_FIELDS = [
   'outputTokens',
   'cacheReadTokens',
   'cacheWriteTokens',
-  'reasoningTokens',
 ] as const
 
 /** 每 step 折叠后的 usage 记录。 */
@@ -61,8 +60,8 @@ interface SessionMeta {
 }
 
 /** 全零计数（避免每次 snapshot 重新造对象）。 */
-function zeroCounts(): TokenUsageFields & { requests: number } {
-  return { inputTokens: 0, outputTokens: 0, cacheReadTokens: 0, cacheWriteTokens: 0, reasoningTokens: 0, requests: 0 }
+function zeroCounts(): Record<(typeof USAGE_FIELDS)[number], number> {
+  return { inputTokens: 0, outputTokens: 0, cacheReadTokens: 0, cacheWriteTokens: 0 }
 }
 
 /** 每 step 记录键。 */
@@ -154,11 +153,13 @@ function thinkingLevel(reasoningTokens: number | undefined): keyof ThinkingLevel
 
 /** DSH 核心工具集：其余工具视为"插件"。 */
 const CORE_TOOLS = new Set([
-  'bash', 'read', 'write', 'edit', 'glob', 'grep', 'todo_write', 'ask_user_question',
-  'subagent', 'workflow', 'ralph', 'create_goal', 'get_goal', 'update_goal',
-  'web_search', 'session_search', 'session_event_search', 'session_trace',
+  'bash', 'read', 'read_image', 'write', 'edit', 'glob', 'grep', 'todo_write', 'ask_user_question',
+  'subagent', 'subagent_fork', 'interrupt_agent', 'list_agents', 'send_message',
+  'job_kill', 'job_list', 'job_output',
+  'workflow', 'ralph', 'create_goal', 'get_goal', 'update_goal', 'exit_plan_mode',
+  'web_search', 'session_search', 'session_event_search', 'session_event_read', 'session_event_trace', 'session_trace',
   'schedule_create', 'schedule_list', 'schedule_delete', 'skill',
-  'cordis_define', 'cordis_run', 'cordis_stop', 'cordis_undefine', 'cordis_inspect',
+  'cordis_define', 'cordis_run', 'cordis_stop', 'cordis_undefine',
   'cordis_inspect_list', 'cordis_inspect_query', 'cordis_inspect_self',
   'mcp__reference_memory__read_graph', 'mcp__reference_memory__search_nodes',
   'mcp__reference_memory__open_nodes', 'mcp__reference_memory__create_entities',
@@ -171,7 +172,7 @@ const CORE_TOOLS = new Set([
  * 只读统计服务：跨全部持久化 session 聚合 token 用量并实时跟随，通过
  * Typert Remote 暴露给浏览器面板。不创建、不恢复任何 Agent / Session。
  */
-export class TokenStatsService extends TypertRemoteService {
+export class TokenUsageService extends TypertRemoteService {
   static inject = ['sessionPersistence']
 
   /** stepUsage: key `${sessionId}:${turn}:${step}` -> 折叠后的 usage 记录。 */
@@ -193,7 +194,7 @@ export class TokenStatsService extends TypertRemoteService {
    * @param ctx - Host context carrying session persistence.
    */
   constructor(ctx: Context) {
-    super(ctx, 'tokenStats')
+    super(ctx, 'tokenUsage')
   }
 
   /** 挂载 live 订阅并启动历史回填（后台进行，不阻塞激活）。 */
@@ -312,7 +313,7 @@ export class TokenStatsService extends TypertRemoteService {
   /** 启动历史回填；持久化服务缺失时退化为仅实时累计。 */
   private async runBackfill(sp: SessionPersistence | undefined): Promise<void> {
     if (!sp || typeof sp.list !== 'function' || typeof sp.inspect !== 'function') {
-      console.warn('[token-stats] sessionPersistence unavailable — live accumulation only')
+      console.warn('[token-usage] sessionPersistence unavailable — live accumulation only')
       this.backfillDone = true
       return
     }
@@ -322,11 +323,11 @@ export class TokenStatsService extends TypertRemoteService {
         try {
           await this.backfillSession(sp, header.id)
         } catch (error) {
-          console.warn(`[token-stats] backfill failed for ${header.id}: ${error instanceof Error ? error.message : String(error)}`)
+          console.warn(`[token-usage] backfill failed for ${header.id}: ${error instanceof Error ? error.message : String(error)}`)
         }
       }
     } catch (error) {
-      console.warn(`[token-stats] session list failed: ${error instanceof Error ? error.message : String(error)}`)
+      console.warn(`[token-usage] session list failed: ${error instanceof Error ? error.message : String(error)}`)
     }
     for (const sessionId of [...this.pending.keys()]) {
       this.foldedSeq.set(sessionId, -1)
@@ -350,7 +351,7 @@ export class TokenStatsService extends TypertRemoteService {
   }
 
   /** 构建 JSON 可序列化的聚合快照。 */
-  private snapshot(): TokenStatsSnapshot {
+  private snapshot(): TokenUsageSnapshot {
     const totals = zeroCounts()
     const dailyTokens = new Map<string, number>()
     const thinkingLevels: ThinkingLevelCounts = { high: 0, medium: 0, low: 0, off: 0 }
@@ -362,7 +363,6 @@ export class TokenStatsService extends TypertRemoteService {
       const total = (usage.inputTokens ?? 0) + (usage.outputTokens ?? 0)
         + (usage.cacheReadTokens ?? 0) + (usage.cacheWriteTokens ?? 0)
       for (const field of USAGE_FIELDS) totals[field] += usage[field] ?? 0
-      totals.requests += 1
 
       const day = dayKey(record.time)
       dailyTokens.set(day, (dailyTokens.get(day) ?? 0) + total)
@@ -380,7 +380,6 @@ export class TokenStatsService extends TypertRemoteService {
     const peakTokens = sessionTotals.size ? Math.max(...sessionTotals.values()) : 0
 
     const sessionDates: string[] = []
-    const typeBreakdown: Record<string, number> = {}
     const sessionIdSet = new Set<string>()
     for (const [id, meta] of this.sessionMeta) {
       sessionIdSet.add(id)
@@ -388,17 +387,15 @@ export class TokenStatsService extends TypertRemoteService {
       if (date && !Number.isNaN(date.getTime())) {
         sessionDates.push(dayKey(date.getTime()))
       }
-      typeBreakdown['dsh'] = (typeBreakdown['dsh'] ?? 0) + 1
     }
     const [currentStreak, longestStreak] = streakDays(sessionDates)
     const maxDurationSec = this.longestChatSegment()
 
-    const topTools = [...this.toolCounts.entries()].sort((a, b) => b[1] - a[1]).slice(0, 5)
     const totalToolCalls = [...this.toolCounts.values()].reduce((a, b) => a + b, 0)
     const distinctTools = this.toolCounts.size
 
     const topPlugins = [...this.toolCounts.entries()]
-      .filter(([name]) => !CORE_TOOLS.has(name) && !name.startsWith('read') && !name.startsWith('edit') && name !== 'skill')
+      .filter(([name]) => !CORE_TOOLS.has(name))
       .sort((a, b) => b[1] - a[1])
       .slice(0, 5)
 
@@ -421,14 +418,12 @@ export class TokenStatsService extends TypertRemoteService {
       longestStreak,
       dailyTokens: Object.fromEntries(dailyTokens),
       thinkingLevels,
-      topTools,
       totalToolCalls,
       distinctTools,
       topPlugins,
       topSkills,
       totalSkillUses,
       distinctSkills,
-      typeBreakdown,
       modelBreakdown: Object.fromEntries(modelCounts),
       earliestDate,
       latestDate,
@@ -441,9 +436,9 @@ export class TokenStatsService extends TypertRemoteService {
    * @returns 全部 session 的 token 用量汇总（纯 JSON）。
    */
   @Remote('getStats')
-  getStats(): TokenStatsSnapshot {
+  getStats(): TokenUsageSnapshot {
     return this.snapshot()
   }
 }
 
-export default TokenStatsService
+export default TokenUsageService

@@ -10,9 +10,9 @@
  *
  * Formal client plugin contract: module exports `inject` + `apply(ctx)`; the
  * loader mounts it into the page's cordis tree and the browser half registers
- * the `shell.overlay` slot. Data comes from the host half's Typert Remote
- * namespace (`ctx.remote.tokenStats.getStats()`).
- * @module dsh-token-usage
+ * the `shell.overlay` slot. Data comes from the host half via the generic RPC
+ * channel (`connection.rpc.call('/api', 'tokenUsage/getStats')`).
+ * @module @deepseek-ai/dsh-token-usage
  */
 
 import * as React from 'react'
@@ -25,10 +25,10 @@ import type {} from '@deepseek-ai/dsh-client-ui-layout/client'
 import type { SidebarFooterActionOwnerProps } from '@deepseek-ai/dsh-client-ui-sidebar/client'
 import type {} from '@deepseek-ai/dsh-client-ui-sidebar/client'
 import type {} from '@deepseek-ai/dsh-client-ui-conversation/client'
-import type { TokenStatsSnapshot } from '../types.ts'
+import type { TokenUsageSnapshot } from '../types.ts'
 
 /* ── module-scope store ──────────────────────────────────────────────────── */
-let latest: TokenStatsSnapshot | null = null
+let latest: TokenUsageSnapshot | null = null
 let lastError: string | null = null
 const listeners = new Set<() => void>()
 
@@ -38,7 +38,7 @@ function subscribe(fn: () => void): () => void {
     listeners.delete(fn)
   }
 }
-function getSnapshot(): TokenStatsSnapshot | null {
+function getSnapshot(): TokenUsageSnapshot | null {
   return latest
 }
 function getError(): string | null {
@@ -71,9 +71,6 @@ const h = React.createElement
 function fmtInt(n: number): string {
   return (n ?? 0).toLocaleString('en-US')
 }
-function fmtYi(n: number): string {
-  return ((n ?? 0) / 100000000).toFixed(2)
-}
 function fmtTok(n: number): string {
   n = n || 0
   return n >= 100000000 ? `${(n / 100000000).toFixed(2)}亿` : n >= 10000 ? `${(n / 10000).toFixed(1)}万` : String(n)
@@ -83,13 +80,13 @@ function fmtTok(n: number): string {
 function dayKeyOf(d: Date): string {
   return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`
 }
-function hmLevelsOf(daily: Record<string, number>): number[] {
-  const vals = Object.values(daily || {}).filter(v => v > 0).sort((a, b) => a - b)
+function hmLevelsOf(vals: number[]): number[] {
+  const sorted = vals.filter(v => v > 0).sort((a, b) => a - b)
   const lv: number[] = []
-  if (vals.length) {
+  if (sorted.length) {
     for (let i = 1; i <= 6; i++) {
-      const idx = Math.min(vals.length - 1, Math.round((vals.length - 1) * i / 6))
-      lv.push(vals[idx]!)
+      const idx = Math.min(sorted.length - 1, Math.round((sorted.length - 1) * i / 6))
+      lv.push(sorted[idx]!)
     }
   }
   return lv
@@ -111,6 +108,7 @@ const ICON_PATHS: Record<string, string> = {
   upload: 'M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4M17 8l-5-5-5 5M12 3v12',
   image: 'M3 5h18v14H3zM3 15l5-5 4 4 3-3 6 6',
   sparkles: 'M12 3l1.9 5.8L20 10l-6.1 1.2L12 17l-1.9-5.8L4 10l6.1-1.2z',
+  zap: 'M13 2 3 14h9l-1 8 10-12h-9l1-8z',
   trash: 'M3 6h18M8 6V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6',
 }
 function Icon({ name, size = 16 }: { name: string; size?: number }): React.ReactElement {
@@ -381,7 +379,7 @@ const PANEL_CSS = `
 `
 
 /** 空快照兜底：数据尚未到达时渲染零值骨架，UI 结构不阻断。 */
-const EMPTY_SNAPSHOT: TokenStatsSnapshot = {
+const EMPTY_SNAPSHOT: TokenUsageSnapshot = {
   totalConversations: 0,
   totalMessages: 0,
   totalTokens: 0,
@@ -392,14 +390,12 @@ const EMPTY_SNAPSHOT: TokenStatsSnapshot = {
   longestStreak: 0,
   dailyTokens: {},
   thinkingLevels: { high: 0, medium: 0, low: 0, off: 0 },
-  topTools: [],
   totalToolCalls: 0,
   distinctTools: 0,
   topPlugins: [],
   topSkills: [],
   totalSkillUses: 0,
   distinctSkills: 0,
-  typeBreakdown: {},
   modelBreakdown: {},
   earliestDate: '',
   latestDate: '',
@@ -449,7 +445,7 @@ function HeaderStatsCapsule(): React.ReactElement {
       title: 'Token 统计 · 点击查看详情',
       'aria-label': 'Token 统计',
     },
-      h(Icon, { name: 'sparkles', size: 12 }),
+      h(Icon, { name: 'zap', size: 12 }),
       h('span', { className: 'dts-header-total' }, data ? fmtTok(data.totalTokens) : '统计中')))
 }
 
@@ -523,7 +519,7 @@ function TokenStatsPanel(): React.ReactElement | null {
     setNameEditing(false)
   }
   const setAvatar = (avatar: string, kind: 'image' | 'emoji'): void => {
-    const next: ProfileState = { avatar, kind, name: draftName.trim() || profile.name }
+    const next: ProfileState = { avatar, kind, name: profile.name }
     setProfile(next)
     saveProfile(next)
     setAvatarOpen(false)
@@ -589,11 +585,11 @@ function TokenStatsPanel(): React.ReactElement | null {
   // 5 指标栏
   const metrics = h('div', { className: 'dts-metrics' },
     h('div', { className: 'dts-metric' },
-      h('div', { className: 'm-num accent' }, fmtYi(s.totalTokens), h('span', { className: 'unit' }, '亿')),
+      h('div', { className: 'm-num accent' }, fmtTok(s.totalTokens)),
       h('div', { className: 'm-label' }, '累计 Token')),
     h('div', { className: 'dts-metric' },
-      h('div', { className: 'm-num' }, fmtYi(s.peakTokens), h('span', { className: 'unit' }, '亿')),
-      h('div', { className: 'm-label' }, '峰值 Token')),
+      h('div', { className: 'm-num' }, fmtTok(s.peakTokens)),
+      h('div', { className: 'm-label' }, '单会话峰值')),
     h('div', { className: 'dts-metric' },
       h('div', { className: 'm-num' }, s.maxDurationText || '0分'),
       h('div', { className: 'm-label' }, '最长聊天时长')),
@@ -611,8 +607,13 @@ function TokenStatsPanel(): React.ReactElement | null {
   const tlTop = Object.entries(tl).sort((a, b) => b[1] - a[1])[0]
   const tlName: Record<string, string> = { high: '高', medium: '中', low: '低', off: '关闭' }
   const tlPct = tlTop && tlTotal ? Math.round((tlTop[1] as number) / tlTotal * 100) : 0
+  const mbEntries = Object.entries(s.modelBreakdown || {})
+  const mbTotal = mbEntries.reduce((a, [, c]) => a + c, 0)
+  const mbTop = mbEntries.sort((a, b) => b[1] - a[1])[0]
+  const mbPct = mbTop && mbTotal ? Math.round((mbTop[1] as number) / mbTotal * 100) : 0
   const insightRows: Array<[string, string]> = [
     ['最常用推理强度', tlTop ? `${tlName[tlTop[0]] || tlTop[0]} · ${tlPct}%` : '—'],
+    ['最常用模型', mbTop ? `${mbTop[0] === 'unknown' ? '未识别' : mbTop[0]} · ${mbPct}%` : '—'],
     ['使用过 Skill', `${s.distinctSkills ?? 0} 个 · ${fmtInt(s.totalSkillUses ?? 0)} 次`],
     ['聊天总数', fmtInt(s.totalConversations ?? 0)],
     ['总消息数', fmtInt(s.totalMessages ?? 0)],
@@ -696,8 +697,10 @@ function TokenStatsPanel(): React.ReactElement | null {
   ) : null
 
   const body = h('div', { className: 'dts-stats-body' },
-    // 仅当已有数据、且后续刷新失败时提示；首轮加载中不显示任何错误条（由"统计中"徽标表达）。
-    (error !== null && data !== null) ? h('div', { className: 'dts-stale-note' }, `刷新失败：${error}，显示上次数据`) : null,
+    // 加载/刷新失败统一提示：首载失败显示"加载失败"，后续刷新失败显示"显示上次数据"。
+    error !== null
+      ? h('div', { className: 'dts-stale-note' }, data !== null ? `刷新失败：${error}，显示上次数据` : `加载失败：${error}`)
+      : null,
     h('div', { className: 'dts-top-actions' },
       h('button', { className: 'dts-icon-btn', type: 'button', onClick: toggleTheme, title: resolvedTheme === 'dark' ? '切换到浅色' : '切换到深色', 'aria-label': '切换主题' },
         h(Icon, { name: resolvedTheme === 'dark' ? 'sun' : 'moon', size: 15 })),
@@ -725,7 +728,7 @@ function TokenStatsPanel(): React.ReactElement | null {
           }),
           h('div', { className: 'dts-edit-actions' },
             h('button', { className: 'dts-edit-btn primary', type: 'button', onClick: commitProfile }, '保存'),
-            h('button', { className: 'dts-edit-btn', type: 'button', onClick: (): void => setNameEditing(false) }, '取消'),
+            h('button', { className: 'dts-edit-btn', type: 'button', onClick: (): void => { setDraftName(profile.name); setNameEditing(false) } }, '取消'),
           ))
         : h('div', { className: 'dts-user-name', onClick: startNameEdit, title: '点击编辑昵称' },
           profile.name,
@@ -750,7 +753,7 @@ function TokenStatsPanel(): React.ReactElement | null {
 
 /* ── heatmap: daily / weekly / cumulative ─────────────────────────────────── */
 interface HeatmapProps {
-  data: TokenStatsSnapshot | null
+  data: TokenUsageSnapshot | null
   hmMode: HmMode
   setHmMode: (mode: HmMode) => void
   tip: TipState | null
@@ -767,32 +770,10 @@ function Heatmap({ data, hmMode, setHmMode, tip: _tip, setTip, loading }: Heatma
   const dayList: Date[] = []
   for (let d = new Date(start); d <= today; d.setDate(d.getDate() + 1)) dayList.push(new Date(d))
   const valOf = (d: Date): number => daily[dayKeyOf(d)] || 0
-
-  const showTip = (e: React.MouseEvent, d: Date, kind: 'd' | 'w' | 'c'): void => {
-    const v = valOf(d)
-    const text = kind === 'w'
-      ? `${d.getMonth() + 1}月${d.getDate()}日 当周使用了 ${fmtTok(weekSum(d))} Token`
-      : kind === 'c'
-        ? `截至${d.getMonth() + 1}月${d.getDate()}日 累计 ${fmtTok(v)} Token`
-        : `${d.getMonth() + 1}月${d.getDate()}日 使用了 ${fmtTok(v)} Token`
-    positionTip(e, text)
-  }
-  const positionTip = (e: React.MouseEvent, text: string): void => {
-    const rect = e.currentTarget ? e.currentTarget.getBoundingClientRect() : null
-    let x = e.clientX + 14
-    const y = e.clientY + 14
-    setTip({ x, y, text })
-    if (rect) {
-      requestAnimationFrame(() => {
-        const el = document.querySelector('.dts-tip')
-        if (el) {
-          const r = el.getBoundingClientRect()
-          if (x + r.width > window.innerWidth) setTip({ x: e.clientX - r.width - 10, y, text })
-        }
-      })
-    }
-  }
-  const hideTip = (): void => setTip(null)
+  const weeks = Math.ceil(dayList.length / 7)
+  const cellArr: Array<Date | null> = []
+  for (let i = 0; i < weeks * 7; i++) cellArr.push(i < dayList.length ? dayList[i]! : null)
+  const windowTotal = dayList.reduce((a, d) => a + valOf(d), 0)
 
   const weekSum = (d: Date): number => {
     let sum = 0
@@ -803,18 +784,29 @@ function Heatmap({ data, hmMode, setHmMode, tip: _tip, setTip, loading }: Heatma
     }
     return sum
   }
+  const positionTip = (e: React.MouseEvent, text: string): void => {
+    let x = e.clientX + 14
+    const y = e.clientY + 14
+    setTip({ x, y, text })
+    requestAnimationFrame(() => {
+      const el = document.querySelector('.dts-tip')
+      if (el) {
+        const r = el.getBoundingClientRect()
+        if (x + r.width > window.innerWidth) setTip({ x: e.clientX - r.width - 10, y, text })
+      }
+    })
+  }
+  const hideTip = (): void => setTip(null)
+  const showTip = (e: React.MouseEvent, d: Date, kind: 'd' | 'w'): void => {
+    const v = valOf(d)
+    const text = kind === 'w'
+      ? `${d.getMonth() + 1}月${d.getDate()}日 当周使用了 ${fmtTok(weekSum(d))} Token`
+      : `${d.getMonth() + 1}月${d.getDate()}日 使用了 ${fmtTok(v)} Token`
+    positionTip(e, text)
+  }
 
   let body: React.ReactElement
   if (hmMode === 'weekly') {
-    const firstDow = start.getDay()
-    const pad = firstDow
-    const cellCount = dayList.length + pad
-    const weeks = Math.ceil(cellCount / 7)
-    const cellArr: Array<Date | null> = []
-    for (let i = 0; i < weeks * 7; i++) {
-      const dayIdx = i - pad
-      cellArr.push(dayIdx >= 0 && dayIdx < dayList.length ? dayList[dayIdx]! : null)
-    }
     const weekSums: number[] = []
     for (let w = 0; w < weeks; w++) {
       let sum = 0
@@ -828,7 +820,7 @@ function Heatmap({ data, hmMode, setHmMode, tip: _tip, setTip, loading }: Heatma
     const wMonthSpans: string[] = []
     let wLastM = -1
     for (let w = 0; w < weeks; w++) {
-      const d = cellArr[w * 7 + pad] || null
+      const d = cellArr[w * 7] || null
       const m = d ? d.getMonth() : -1
       wMonthSpans.push((d && m !== wLastM) ? `${m + 1}月` : '')
       if (d && m !== wLastM) wLastM = m
@@ -836,7 +828,7 @@ function Heatmap({ data, hmMode, setHmMode, tip: _tip, setTip, loading }: Heatma
     body = h('div', null,
       h('div', { className: 'hm-months' }, wMonthSpans.map((t, i) => h('span', { key: i }, t))),
       h('div', { className: 'hm-bars' }, weekSums.map((sum, i) => {
-        const d0 = cellArr[i * 7 + pad] || cellArr[i * 7] || dayList[0]!
+        const d0 = cellArr[i * 7] || dayList[0]!
         const hh = sum > 0 ? Math.max(4, Math.round(sum / maxW * 96)) : 2
         return h('div', {
           key: i,
@@ -913,24 +905,15 @@ function Heatmap({ data, hmMode, setHmMode, tip: _tip, setTip, loading }: Heatma
       xLabels,
     )
   } else {
-    const firstDow = start.getDay()
-    const pad = firstDow
-    const cellCount = dayList.length + pad
-    const weeks = Math.ceil(cellCount / 7)
-    const cellArr: Array<Date | null> = []
-    for (let i = 0; i < weeks * 7; i++) {
-      const dayIdx = i - pad
-      cellArr.push(dayIdx >= 0 && dayIdx < dayList.length ? dayList[dayIdx]! : null)
-    }
     const monthSpans: string[] = []
     let lastM = -1
     for (let w = 0; w < weeks; w++) {
-      const d = cellArr[w * 7 + pad] || null
+      const d = cellArr[w * 7] || null
       const m = d ? d.getMonth() : -1
       monthSpans.push((d && m !== lastM) ? `${m + 1}月` : '')
       if (d && m !== lastM) lastM = m
     }
-    const levels = hmLevelsOf(daily)
+    const levels = hmLevelsOf(dayList.map(valOf))
     body = h('div', null,
       h('div', { className: 'hm-months' }, monthSpans.map((t, i) => h('span', { key: i }, t))),
       h('div', { className: 'hm-grid' }, cellArr.map((d, i) => {
@@ -954,8 +937,8 @@ function Heatmap({ data, hmMode, setHmMode, tip: _tip, setTip, loading }: Heatma
       h('span', null, '多'))
     : h('div', { className: 'hm-legend' },
       hmMode === 'weekly'
-        ? h('span', null, `${dayList.length} 天 · ${Math.ceil((dayList.length + start.getDay()) / 7)} 周`)
-        : h('span', null, `累计 ${fmtTok(Object.values(daily).reduce((a, b) => a + b, 0))} · ${dayList.length} 天`))
+        ? h('span', null, `${dayList.length} 天 · ${weeks} 周`)
+        : h('span', null, `累计 ${fmtTok(windowTotal)} · ${dayList.length} 天`))
 
   return h('div', { className: 'dts-heatmap' },
     h('div', { className: 'hm-header' },
@@ -1001,14 +984,14 @@ export function apply(ctx: ClientContext): void {
     }
   }, 'dsh-token-usage: styles')
 
-  // 通用 RPC：直接调网关暴露的 tokenStats/getStats，独立安装无需改动
+  // 通用 RPC：直接调网关暴露的 tokenUsage/getStats，独立安装无需改动
   // DSH 的 api-remotes 装配（host 侧 TypertRemoteService 自动注册该端点）。
   const connection = ctx.get('connection') as ConnectionHandle
   const refresh = async (): Promise<void> => {
     try {
-      const result = await connection.rpc.call('/api', 'tokenStats/getStats', { args: {} })
+      const result = await connection.rpc.call('/api', 'tokenUsage/getStats', { args: {} })
       if (result.ok) {
-        latest = result.value as TokenStatsSnapshot
+        latest = result.value as TokenUsageSnapshot
         lastError = null
       } else {
         lastError = `${result.error.code}: ${result.error.message}`
@@ -1026,17 +1009,17 @@ export function apply(ctx: ClientContext): void {
     }, 5000)
     // 面板模态框：shell.overlay（list 座位，独立 id）。
     const disposeOverlay = ctx.slots.inject('shell.overlay', () => ctx.slots.register(
-      { name: 'shell.overlay', id: 'token-stats', order: 100, label: 'Token 统计' },
+      { name: 'shell.overlay', id: 'token-usage', order: 100, label: 'Token 统计' },
       TokenStatsPanel,
     ))
     // 入口 1：侧边栏底部（应用级常驻，挨着设置）。
     const disposeSidebar = ctx.slots.inject('sidebar.footer.action', () => ctx.slots.register(
-      { name: 'sidebar.footer.action', id: 'token-stats-sidebar' },
+      { name: 'sidebar.footer.action', id: 'token-usage-sidebar' },
       SidebarStatsEntry,
     ))
     // 入口 2：会话头部实时用量胶囊。
     const disposeHeader = ctx.slots.inject('conversation.session.header.actions', () => ctx.slots.register(
-      { name: 'conversation.session.header.actions', id: 'token-stats-header', order: 90 },
+      { name: 'conversation.session.header.actions', id: 'token-usage-header', order: 90 },
       HeaderStatsCapsule,
     ))
     return () => {

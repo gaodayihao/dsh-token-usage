@@ -1,7 +1,7 @@
 # dsh-token-usage bundle patch: Token 用量统计面板（Session Gallery 风格）
 #
 # 本包同时是：
-#  - 一个 Cordis 插件包（host 半边 = TokenStatsService，浏览器半边 = 面板）
+#  - 一个 Cordis 插件包（host 半边 = TokenUsageService，浏览器半边 = 面板）
 #  - 一个 profile bundle（下面的 insert 把插件行挂进加载树；dsh.client 声明让
 #    client-modules 把浏览器半边注入每个 web 页面）
 - insert:

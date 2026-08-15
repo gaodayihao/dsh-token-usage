@@ -3,17 +3,17 @@ import type {
   RemoteResult,
   TypertRemoteContribution,
 } from '@deepseek-ai/dsh-typert-protocol'
-import type { TokenStatsSnapshot } from '@deepseek-ai/dsh-token-stats/types'
+import type { TokenUsageSnapshot } from '@deepseek-ai/dsh-token-usage/types'
 
 declare module '@deepseek-ai/dsh-typert-protocol' {
-  interface TypertRemoteNamespace$746f6b656e5374617473 {
-    getStats: () => Promise<RemoteResult<TokenStatsSnapshot>>
+  interface TypertRemoteNamespace$746f6b656e5573616765 {
+    getStats: () => Promise<RemoteResult<TokenUsageSnapshot>>
   }
   interface TypertRemoteMap {
-    'tokenStats/getStats': () => Promise<RemoteResult<TokenStatsSnapshot>>
+    'tokenUsage/getStats': () => Promise<RemoteResult<TokenUsageSnapshot>>
   }
   interface TypertRemoteNamespaceMap {
-    'tokenStats': TypertRemoteNamespace$746f6b656e5374617473
+    'tokenUsage': TypertRemoteNamespace$746f6b656e5573616765
   }
 }
 
