@@ -13,7 +13,7 @@ export interface TokenUsageFields {
   reasoningTokens: number
 }
 
-/** 推理强度档位计数（由 reasoningTokens 近似；DSH 无显式 thinking 等级）。 */
+/** 推理强度档位计数（取 `request/header` 的 reasoningEffort；无该事件时回退 reasoningTokens 近似）。 */
 export interface ThinkingLevelCounts {
   high: number
   medium: number

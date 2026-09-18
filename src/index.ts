@@ -17,8 +17,9 @@
  *    不重复计数），并携带 `message.source.model`。
  *
  * 与 OpenClaw 版的差异：DSH 无火山平台真实总量（GLM）校准，累计 token 直接取
- * provider 返回的 usage（input + output + cacheRead + cacheWrite）；thinking 等级
- * 由 reasoningTokens 近似。
+ * provider 返回的 usage（input + output + cacheRead + cacheWrite）；推理强度取
+ * `request/header` 的 `header.config.reasoningEffort`（DSH 实际下发档位），
+ * 仅在没有该事件的旧日志上回退 reasoningTokens 近似。
  * @module @deepseek-ai/dsh-token-usage
  */
 
@@ -49,6 +50,8 @@ interface StepRecord {
   model: string | null
   time: number
   sessionId: string
+  /** 该 step 生效的推理强度（request/header 权威值；缺失时回退 tokens 近似）。 */
+  effort?: string
 }
 
 /** 一个会话的消息时间线（>30min 间隔切分为段）。 */
@@ -143,13 +146,41 @@ function modelFamily(model: string): string {
   return m || 'Other'
 }
 
-/** reasoningTokens -> thinking 等级近似。 */
+/** reasoningTokens -> thinking 等级近似（仅在无 request/header 权威值时兜底）。 */
 function thinkingLevel(reasoningTokens: number | undefined): keyof ThinkingLevelCounts {
   const r = reasoningTokens || 0
   if (r <= 0) return 'off'
   if (r <= 2000) return 'low'
   if (r <= 8000) return 'medium'
   return 'high'
+}
+
+/**
+ * DSH 权威推理强度 -> 面板四档。
+ *
+ * `request/header` 的 `header.config.reasoningEffort` 是 DSH 实际下发的档位，
+ * 只在变化时落盘，因此取最近一次快照即为该 step 生效值。
+ * 返回 undefined 表示档位未知（调用方回退 reasoningTokens 近似）。
+ */
+function effortBucket(effort: string | undefined): keyof ThinkingLevelCounts | undefined {
+  if (!effort) return undefined
+  switch (effort.toLowerCase()) {
+    case 'off':
+    case 'none':
+      return 'off'
+    case 'low':
+    case 'minimal':
+      return 'low'
+    case 'medium':
+      return 'medium'
+    case 'high':
+    case 'xhigh':
+    case 'max':
+    case 'ultra':
+      return 'high'
+    default:
+      return undefined
+  }
 }
 
 /** DSH 核心工具集：其余工具视为"插件"。 */
@@ -190,6 +221,8 @@ export class TokenUsageService extends TypertRemoteService {
   private readonly skillCounts = new Map<string, number>()
   /** sessionMeta: sessionId -> 消息时间线元数据。 */
   private readonly sessionMeta = new Map<string, SessionMeta>()
+  /** currentEffort: sessionId -> 最近一次 request/header 生效的推理强度。 */
+  private readonly currentEffort = new Map<string, string>()
 
   /**
    * @param ctx - Host context carrying session persistence.
@@ -221,11 +254,19 @@ export class TokenUsageService extends TypertRemoteService {
   /** 折叠一条 session 事件（usage / 消息时间线 / 工具与 skill 计数）。 */
   private foldEvent(sessionId: string, event: SessionEvent): void {
     const data = event.data
-    if (event.type === 'assistant/chunk') {
+    if (event.type === 'request/header') {
+      // 权威推理强度：只在变化时落盘，因此记住最近一次即为后续 step 的生效值。
+      const effort = (data as { header?: { config?: { reasoningEffort?: unknown } } } | undefined)
+        ?.header?.config?.reasoningEffort
+      if (typeof effort === 'string' && effort) this.currentEffort.set(sessionId, effort)
+    } else if (event.type === 'assistant/chunk') {
       const chunk = data && (data as { chunk?: { type?: string; usage?: TokenUsageFields } }).chunk
       if (chunk && chunk.type === 'usage' && chunk.usage) {
         const key = stepKey(sessionId, (data as { turn: number }).turn, (data as { step: number }).step)
-        this.stepUsage.set(key, { usage: chunk.usage, model: null, time: event.time, sessionId })
+        this.stepUsage.set(key, {
+          usage: chunk.usage, model: null, time: event.time, sessionId,
+          effort: this.currentEffort.get(sessionId),
+        })
       }
     } else if (event.type === 'assistant/message') {
       const usage = data && (data as { usage?: TokenUsageFields }).usage
@@ -233,7 +274,10 @@ export class TokenUsageService extends TypertRemoteService {
         const key = stepKey(sessionId, (data as { turn: number }).turn, (data as { step: number }).step)
         const source = data && (data as { message?: { source?: { model?: string } } }).message?.source
         const model = source && source.model ? String(source.model) : null
-        this.stepUsage.set(key, { usage, model, time: event.time, sessionId })
+        this.stepUsage.set(key, {
+          usage, model, time: event.time, sessionId,
+          effort: this.currentEffort.get(sessionId),
+        })
       }
       this.bumpMessage(sessionId, event.time)
     } else if (event.type === 'user/message') {
@@ -307,6 +351,17 @@ export class TokenUsageService extends TypertRemoteService {
         else this.sessionMeta.set(sessionId, { createdAt, messageCount: 0, lastMsgTime: null, segStart: null, maxSeg: 0 })
       }
       const { events } = await handle.read(0)
+      // DSH 的初始 request/header 可能不带 reasoningEffort（由 adapter 默认值决定）。
+      // 用该 session 首个明确档位为最早的几步兜底，避免退化成靠 token 猜测的"关闭"。
+      for (const ev of events) {
+        if (ev.type !== 'request/header') continue
+        const e = (ev.data as { header?: { config?: { reasoningEffort?: unknown } } })
+          ?.header?.config?.reasoningEffort
+        if (typeof e === 'string' && e) {
+          this.currentEffort.set(sessionId, e)
+          break
+        }
+      }
       for (const event of events) {
         if (event.seq <= maxSeq) continue
         maxSeq = event.seq
@@ -378,7 +433,8 @@ export class TokenUsageService extends TypertRemoteService {
       const day = dayKey(record.time)
       dailyTokens.set(day, (dailyTokens.get(day) ?? 0) + total)
 
-      const level = thinkingLevel(usage.reasoningTokens)
+      // 优先用 DSH 权威档位；仅在没有 request/header 记录的旧日志上回退 token 近似。
+      const level = effortBucket(record.effort) ?? thinkingLevel(usage.reasoningTokens)
       thinkingLevels[level] += 1
 
       const model = record.model ?? 'unknown'
