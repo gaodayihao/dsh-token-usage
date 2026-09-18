@@ -3,7 +3,7 @@ import type {
   RemoteResult,
   TypertRemoteContribution,
 } from '@deepseek-ai/dsh-typert-protocol'
-import type { TokenUsageSnapshot } from '@deepseek-ai/dsh-token-usage/types'
+import type { TokenUsageSnapshot } from 'dsh-token-usage/types'
 
 declare module '@deepseek-ai/dsh-typert-protocol' {
   interface TypertRemoteNamespace$746f6b656e5573616765 {

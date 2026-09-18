@@ -3,8 +3,9 @@
  *
  * 仿照 Codex 个人用量页统计面板的数据口径，
  * 后端逻辑完全基于 DSH 原生数据：
- *  - Backfill：激活时通过 `ctx.sessionPersistence.list()/inspect()` 枚举每个持久化
- *    session，从存储事件折叠 usage / 工具调用 / 消息时间线，面板覆盖历史。
+ *  - Backfill：激活时通过 `ctx.sessionPersistence.list()` 枚举持久化 session，
+ *    再经 `open(id, 'read')` + `handle.read()` 读取事件日志，
+ *    从存储事件折叠 usage / 工具调用 / 消息时间线，面板覆盖历史。
  *  - Live：订阅 `session/event`，把同样的信号实时折叠进来。
  *  - RPC：`@Remote('getStats')` 把聚合快照通过 Typert Remote 暴露给浏览器半边
  *    （client 侧通过通用 RPC 通道调用 `tokenUsage/getStats`）。
@@ -295,16 +296,24 @@ export class TokenUsageService extends TypertRemoteService {
   /** 回填一个 session 的持久日志，然后消化其缓冲事件。 */
   private async backfillSession(sp: SessionPersistence, sessionId: SessionId): Promise<void> {
     let maxSeq = this.foldedSeq.get(sessionId) ?? -1
-    const { meta, events } = await sp.inspect(sessionId)
-    if (meta && meta.createdAt) {
-      const existing = this.sessionMeta.get(sessionId)
-      if (existing) existing.createdAt = meta.createdAt
-      else this.sessionMeta.set(sessionId, { createdAt: meta.createdAt, messageCount: 0, lastMsgTime: null, segStart: null, maxSeg: 0 })
-    }
-    for (const event of events) {
-      if (event.seq <= maxSeq) continue
-      maxSeq = event.seq
-      this.foldEvent(sessionId, event)
+    // SessionPersistence.open(id, 'read') + handle.read() replaced the legacy
+    // inspect(); the header carries the creation time the fold needs.
+    const handle = await sp.open(sessionId, 'read')
+    try {
+      const { createdAt } = handle.header
+      if (createdAt) {
+        const existing = this.sessionMeta.get(sessionId)
+        if (existing) existing.createdAt = createdAt
+        else this.sessionMeta.set(sessionId, { createdAt, messageCount: 0, lastMsgTime: null, segStart: null, maxSeg: 0 })
+      }
+      const { events } = await handle.read(0)
+      for (const event of events) {
+        if (event.seq <= maxSeq) continue
+        maxSeq = event.seq
+        this.foldEvent(sessionId, event)
+      }
+    } finally {
+      await handle.close()
     }
     this.foldedSeq.set(sessionId, maxSeq)
     this.drainPending(sessionId)
@@ -312,18 +321,20 @@ export class TokenUsageService extends TypertRemoteService {
 
   /** 启动历史回填；持久化服务缺失时退化为仅实时累计。 */
   private async runBackfill(sp: SessionPersistence | undefined): Promise<void> {
-    if (!sp || typeof sp.list !== 'function' || typeof sp.inspect !== 'function') {
+    if (!sp || typeof sp.list !== 'function' || typeof sp.open !== 'function') {
       console.warn('[token-usage] sessionPersistence unavailable — live accumulation only')
       this.backfillDone = true
       return
     }
     try {
-      const headers = await sp.list()
-      for (const header of headers) {
+      const snapshots = await sp.list()
+      for (const snapshot of snapshots) {
+        const sessionId = snapshot?.header?.id
+        if (!sessionId) continue
         try {
-          await this.backfillSession(sp, header.id)
+          await this.backfillSession(sp, sessionId)
         } catch (error) {
-          console.warn(`[token-usage] backfill failed for ${header.id}: ${error instanceof Error ? error.message : String(error)}`)
+          console.warn(`[token-usage] backfill failed for ${sessionId}: ${error instanceof Error ? error.message : String(error)}`)
         }
       }
     } catch (error) {
