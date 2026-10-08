@@ -39,18 +39,45 @@ DSH 刚发布，大家最关心的就是：**我的 Token 到底花哪去了？*
 
 需要 DSH **0.2.1 及以上**。插件依赖 DSH 内置包（`@deepseek-ai/*`），运行时由 DSH 自己解析，无需额外构建。
 
-### 方式一：让 Agent 一句话装好（推荐）
+### 方式一：直接从 GitHub 安装（推荐）
 
-把下面这句话发给你的 DSH Agent，它会自己读这个仓库的说明并完成安装：
-
-> 你看一下这个仓库：https://github.com/jiamuAi/dsh-token-usage ，然后帮我把 dsh-token-usage 安装到我的 DSH 上。
-
-### 方式二：命令行装
+不用克隆仓库、本地也不用留一份源码，一条命令装好：
 
 ```sh
-git clone https://github.com/jiamuAi/dsh-token-usage.git
-dsh plugin --profile web add "file:$(pwd)/dsh-token-usage"
+dsh plugin --profile web add github:gaodayihao/dsh-token-usage
 ```
+
+不想开终端，也可以把这句话发给 DSH Agent，让它自己读仓库说明并装好：
+
+> 你看一下这个仓库：https://github.com/gaodayihao/dsh-token-usage ，然后帮我把 dsh-token-usage 安装到我的 DSH 上。
+
+或者在 Web 界面走 **插件 → 添加插件**，填入同样的规格
+`github:gaodayihao/dsh-token-usage`（DSH 认 `github:` 简写；连不上 GitHub 时界面会提示改用国内镜像）。
+
+**为什么这个仓库能直装**：仓库里已提交构建产物 `lib/`，并且**没有 `prepare` /
+`postinstall` 脚本** —— pnpm 不会执行任何构建，也不会留下
+`allowBuilds: { dsh-token-usage: set this to true or false }` 这种待审批条目
+（带 `prepare` 的 Git 插件会被 pnpm 11 拦下，必须先去 profile 的
+`pnpm-workspace.yaml` 里逐个放行）。装完即是可运行状态。
+
+前提：本机有 `git`（pnpm 先用 `git ls-remote <repo> HEAD` 解析 ref，再下载该 commit 的
+tarball），并且能访问 github.com —— 国内网络可走代理，或在 Web 界面按提示改用镜像源。
+
+想锁死版本就带上 tag 或 commit：
+
+```sh
+dsh plugin --profile web add "github:gaodayihao/dsh-token-usage#v0.2.0"
+```
+
+不带 ref 时，pnpm 会把这次解析到的默认分支 commit 钉进 `pnpm-lock.yaml`，
+已经在跑的实例不会因为仓库有新提交就被换掉；要挪到默认分支的最新 commit 用：
+
+```sh
+dsh plugin --profile web update dsh-token-usage
+```
+
+（`update` 会把 `github:` 规格重新解析到默认分支的新 commit；万一没动，就先
+`dsh plugin --profile web remove dsh-token-usage`，再按上面的 `add` 装一次。）
 
 `dsh plugin` 走的是 DSH 0.2.x 的原生 bundle 安装：把它写进 `~/.dsh/profiles/web/package.json`
 的 `dependencies` 和 `dsh.profile.bundles`，并自动应用包内的 `cordis.patch.yml`，
@@ -58,9 +85,22 @@ dsh plugin --profile web add "file:$(pwd)/dsh-token-usage"
 
 最后重启 `dsh web`，刷新页面即可看到入口。
 
-> 仓库里若有已推送的 0.2.0 版本，也可以直接 `dsh plugin --profile web add github:jiamuAi/dsh-token-usage`。
+> **本仓库是 [`jiamuAi/dsh-token-usage`](https://github.com/jiamuAi/dsh-token-usage) 的 fork。**
+> 上游 main 仍是 0.1.0（2026-08-15），在 DSH 0.2.1 上会因 TYPERT manifest /
+> client bundle 写错包名而加载失败（见上游 issue #1）；本 fork 已含修复。
+> 等修复合并回上游后，把上面的 `gaodayihao` 换成 `jiamuAi` 即可。
 
-### ⚠️ 必须用 `file:` 或 `github:`，不要用 `link:` 或裸路径
+### 方式二：本地源码（改插件代码时用）
+
+```sh
+git clone https://github.com/gaodayihao/dsh-token-usage.git
+dsh plugin --profile web add "file:$(pwd)/dsh-token-usage"
+```
+
+`file:` 装的是目录依赖，本地改完 `lib/` 重装即生效，适合开发调试；
+对外分发请用上面的 `github:` 装法。
+
+### ⚠️ 装本地源码时必须用 `file:`，不要用 `link:` 或裸路径
 
 `dsh plugin --profile web add <绝对路径>`（不加 `file:` 前缀）会被 pnpm 记成
 `link:`，而 **`link:` 不会安装该包的依赖**。本插件生成的 `lib/typert.host.js`
@@ -78,6 +118,9 @@ typert-loader: dsh-token-usage exports "./typert" but importing ... failed:
 `directoryPicker/pick: its strict definition was withdrawn and SRC fallback is forbidden`）。
 数据不会丢，`~/.dsh/storages/workspace.json` 和会话日志都还在，移除该依赖重启即可恢复。
 
+`file:` 与 `github:` 都**会**正常安装依赖（package 的 `node_modules` 里能看到 `zod`）；
+只有 `link:` 例外。上面的 GitHub 直装因此没有这个坑。
+
 要确认装对了，可以在装完后跑一次（把路径换成 profile 里的安装副本）：
 
 ```sh
@@ -90,7 +133,7 @@ node -e "import('file:///C:/Users/<你>/.dsh/profiles/web/node_modules/dsh-token
 
 1. 若 `~/.dsh/profiles/web/package.json` 里已有一条旧的 `dsh-token-usage` 依赖，
    先 `dsh plugin --profile web remove dsh-token-usage`，再按上面重新安装
-   （注意用 `file:` 前缀，见下面的警告）。
+   （GitHub 直装，或本地源码加 `file:` 前缀）。
 2. 若 profile 配置（`cordis.yml` / `cordis.patch.yml` / `--patch`）里有 `name` 为
    `@deepseek-ai/dsh-invariants` 或以 `/invariant` 结尾的行，请删掉 —— DSH
    v0.2.0-rc.2 起不再发布 `invariants` 服务与任何 `<包>/invariant` 子路径。
@@ -145,6 +188,20 @@ node -e "import('file:///C:/Users/<你>/.dsh/profiles/web/node_modules/dsh-token
 ## 开发
 
 `lib/` 里是现成构建产物，**一般使用者无需构建**。要改代码的话，构建链路依赖 DSH 仓库的编译工具（tsc + tsdown + Typert 生成器），把 `src/` 放进 DSH 仓库的 `packages/extensions/dsh-token-usage/` 下构建，构建产物 `lib/` 同步回本仓库提交即可。
+
+### 发布（给维护者）
+
+GitHub 直装取的是**已提交的文件**，所以每次对外发布都要：
+
+1. 同步 `src/` 与 `lib/` 后再提交（`lib/` 漏提交 = 使用者装到旧代码）；
+2. 不要添加 `prepare` / `preinstall` / `postinstall` 脚本 —— 一旦有，pnpm 11 会把构建脚本挂起等 `allowBuilds` 审批，直装不再开箱可用；
+3. 打 tag 并推送，让使用者可以锁版本：
+
+   ```sh
+   git tag v0.2.0 && git push origin main --tags
+   ```
+
+4. 发布后在干净环境验证一次：`dsh plugin --profile web add "github:gaodayihao/dsh-token-usage#v0.2.0"`。
 
 ## License
 

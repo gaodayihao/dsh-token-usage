@@ -1,5 +1,22 @@
 # Changelog
 
+## [Unreleased]
+
+### Changed
+
+- **安装文档改为「GitHub 直装」优先**：主推
+  `dsh plugin --profile web add github:gaodayihao/dsh-token-usage`，不再要求先 clone 到本地；
+  `file:` 本地目录安装降级为「改插件代码时用」的方式，并补充 Web 界面
+  「插件 → 添加插件」直填 `github:` 规格的路径。
+- **修正文档里的仓库地址**：原 README 指向上游 `jiamuAi/dsh-token-usage`，其 main 仍是 0.1.0，
+  在 DSH 0.2.1 上会因 TYPERT manifest / client bundle 包名错误而加载失败（上游 issue #1）；
+  改指本 fork（含 0.2.1 兼容修复），并在 README 中注明 fork 关系与回归上游的条件。
+- **说明为什么本仓库可以直接从 Git 安装**：`lib/` 已提交、且没有 `prepare` / `postinstall`
+  脚本，pnpm 不会挂起构建等 `allowBuilds` 审批；同时补充「不要添加 prepare 脚本」的维护者发布清单、
+  锁版本（`#v0.2.0` / commit）与 `dsh plugin update` 升级方式。
+- `README.en.md` 的安装一节此前还是 0.1.x 的「拷进 DSH 仓库 + build:lib」老流程，已整体重写为
+  与中文版一致；并补上 `link:` 陷阱与升级说明。
+
 ## [0.2.0] - 2026-10-08
 
 适配 DSH 0.2.1（`0.2.1-alpha.1`），插件在 DSH 升级后不再加载的问题已修复。
