@@ -4,3 +4,5 @@ node_modules/
 .DS_Store
 # 本地开发同步脚本（含本机路径，不提交）
 scripts/dev-sync.sh
+# 安装前对本机 DSH profile 配置做的备份（含本机路径，不提交）
+.profile-backup/

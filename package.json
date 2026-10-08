@@ -1,6 +1,6 @@
 {
   "name": "dsh-token-usage",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "DSH Token 用量统计面板（Codex 风格）：全实例 Token 消耗汇总 + 活动热力图。",
   "type": "module",
   "main": "lib/types/index.js",
@@ -9,10 +9,6 @@
     ".": {
       "types": "./lib/types/index.d.ts",
       "default": "./lib/types/index.js"
-    },
-    "./invariant": {
-      "types": "./lib/types/invariant.d.ts",
-      "default": "./lib/types/invariant.js"
     },
     "./types": {
       "types": "./lib/types/types.d.ts",
@@ -71,16 +67,18 @@
     "codex"
   ],
   "license": "MIT",
+  "engines": {
+    "node": ">=20"
+  },
   "dependencies": {
     "zod": "^4.4.3"
   },
   "peerDependencies": {
-    "@deepseek-ai/cordis": "workspace:^",
-    "@deepseek-ai/dsh-client-connection": "workspace:^",
-    "@deepseek-ai/dsh-invariants": "workspace:^",
-    "@deepseek-ai/dsh-session": "workspace:^",
-    "@deepseek-ai/dsh-session-persistence": "workspace:^",
-    "@deepseek-ai/dsh-typert-protocol": "workspace:^",
+    "@deepseek-ai/cordis": "~4.0.5-alpha.1",
+    "@deepseek-ai/dsh-client-connection": "^0.2.1-alpha.1",
+    "@deepseek-ai/dsh-session": "^0.2.1-alpha.1",
+    "@deepseek-ai/dsh-session-persistence": "^0.2.1-alpha.1",
+    "@deepseek-ai/dsh-typert-protocol": "^0.2.1-alpha.1",
     "react": "^18.2.0"
   }
 }

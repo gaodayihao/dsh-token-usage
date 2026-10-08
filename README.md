@@ -37,7 +37,7 @@ DSH 刚发布，大家最关心的就是：**我的 Token 到底花哪去了？*
 
 ## 安装
 
-插件依赖 DSH 内置包（`@deepseek-ai/*`），放进 DSH 仓库即可自动解析，无需额外安装。
+需要 DSH **0.2.1 及以上**。插件依赖 DSH 内置包（`@deepseek-ai/*`），运行时由 DSH 自己解析，无需额外构建。
 
 ### 方式一：让 Agent 一句话装好（推荐）
 
@@ -45,23 +45,33 @@ DSH 刚发布，大家最关心的就是：**我的 Token 到底花哪去了？*
 
 > 你看一下这个仓库：https://github.com/jiamuAi/dsh-token-usage ，然后帮我把 dsh-token-usage 安装到我的 DSH 上。
 
-### 方式二：手动装
+### 方式二：命令行装
 
 ```sh
 git clone https://github.com/jiamuAi/dsh-token-usage.git
-cp -R dsh-token-usage <你的deepseek-harness路径>/packages/extensions/
-cd <你的deepseek-harness路径> && pnpm install && pnpm run build:lib
+dsh plugin --profile web add "$(pwd)/dsh-token-usage"
 ```
 
-> `<你的deepseek-harness路径>` = DSH 源码在你机器上的位置。不知道在哪？终端执行 `readlink -f $(which dsh)` 能看到 dsh 的真实路径，往上找 `deepseek-harness` 目录就是。
-
-然后编辑 `~/.dsh/profiles/web/package.json`，在 `dsh.profile.bundles` 里加上：
-
-```json
-"dsh-token-usage"
-```
+`dsh plugin` 走的是 DSH 0.2.x 的原生 bundle 安装：把它写进 `~/.dsh/profiles/web/package.json`
+的 `dependencies` 和 `dsh.profile.bundles`，并自动应用包内的 `cordis.patch.yml`，
+把插件行插进加载树。装到别处就换 `--profile` 的名字（如 `tui`）。
 
 最后重启 `dsh web`，刷新页面即可看到入口。
+
+> 仓库里若有已推送的 0.2.0 版本，也可以直接 `dsh plugin --profile web add github:jiamuAi/dsh-token-usage`。
+
+### 从 0.1.x 升级
+
+1. 若 `~/.dsh/profiles/web/package.json` 里已有一条旧的 `dsh-token-usage` 依赖，
+   先 `dsh plugin --profile web remove dsh-token-usage`，再按上面重新安装。
+2. 若 profile 配置（`cordis.yml` / `cordis.patch.yml` / `--patch`）里有 `name` 为
+   `@deepseek-ai/dsh-invariants` 或以 `/invariant` 结尾的行，请删掉 —— DSH
+   v0.2.0-rc.2 起不再发布 `invariants` 服务与任何 `<包>/invariant` 子路径。
+3. 重启 `dsh web` 并刷新页面。
+
+> **0.1.x 的老装法已废弃**：以前是把源码拷进 `<deepseek-harness>/packages/extensions/`
+> 再跑 `pnpm run build:lib`。DSH 更新会覆盖仓库目录，拷进去的文件随之丢失，插件于是"失效"。
+> 请改用上面的 profile 安装方式，它写在 `~/.dsh/profiles/` 下，不受 DSH 更新影响。
 
 ## 使用
 

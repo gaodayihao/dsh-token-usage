@@ -16,7 +16,7 @@
  */
 
 import * as React from 'react'
-import type { ClientContext } from '@deepseek-ai/dsh-client-runtime/client'
+import type { Context as ClientContext } from '@deepseek-ai/cordis'
 // 通用 RPC 通道：独立安装时不需要改动 DSH 的 api-remotes 装配。
 import type { ConnectionHandle } from '@deepseek-ai/dsh-client-connection/client'
 // Brings the `shell.overlay` slot declaration (ui-layout owns the seat).
