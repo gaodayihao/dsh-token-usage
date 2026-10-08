@@ -19,6 +19,13 @@
   仓库内部，装到 profile 里会解析失败/被兼容性闸门拦下；现按官方插件写法声明
   `^0.2.1-alpha.1`（`@deepseek-ai/cordis` 为 `~4.0.5-alpha.1`）。
 - 补充 `engines.node >= 20`。
+- **安装方式必须是 `file:` / `github:`，不能是 `link:` 或裸路径**：裸绝对路径会被
+  pnpm 记成 `link:`，而 `link:` 不安装依赖，插件目录不在 profile 的 `node_modules`
+  之下，`lib/typert.host.js` 的 `import 'zod'` 永远解析不到。typert-loader 只要
+  有一个 contributor 注册失败就中止整轮注册，导致所有 Remote 端点丢掉 strict
+  定义、Web 界面整体失效（工作区列表空白、目录选择器报
+  `its strict definition was withdrawn and SRC fallback is forbidden`）。数据无损，
+  移除依赖重启即恢复。README「安装」一节已写明该陷阱与自检命令。
 
 ### Changed
 
@@ -30,6 +37,9 @@
 - `dsh --profile web --dump-config` 组合出的加载树含 `- id: token-usage / name: dsh-token-usage`。
 - 客户端 bundle 仅 `require('react')`（DSH 平台模块表基线），并导出 `inject` + `apply`。
 - Host 半边仅依赖 `@deepseek-ai/cordis` 与 `@deepseek-ai/dsh-typert-protocol`，两者在 0.2.1 仍在。
+- 用 `file:` 装进 profile 后，直接 `import()` 安装副本的 `lib/typert.host.js` 成功
+  打印 `TYPERT { package: 'dsh-token-usage', face: 'host', invocations: ['dsh-token-usage#tokenUsage/getStats'] }`
+  —— 这正是此前失败的那一步（zod 解析）。
 
 ## [0.1.0] - 2026-08-15
 

@@ -49,7 +49,7 @@ DSH 刚发布，大家最关心的就是：**我的 Token 到底花哪去了？*
 
 ```sh
 git clone https://github.com/jiamuAi/dsh-token-usage.git
-dsh plugin --profile web add "$(pwd)/dsh-token-usage"
+dsh plugin --profile web add "file:$(pwd)/dsh-token-usage"
 ```
 
 `dsh plugin` 走的是 DSH 0.2.x 的原生 bundle 安装：把它写进 `~/.dsh/profiles/web/package.json`
@@ -60,10 +60,37 @@ dsh plugin --profile web add "$(pwd)/dsh-token-usage"
 
 > 仓库里若有已推送的 0.2.0 版本，也可以直接 `dsh plugin --profile web add github:jiamuAi/dsh-token-usage`。
 
+### ⚠️ 必须用 `file:` 或 `github:`，不要用 `link:` 或裸路径
+
+`dsh plugin --profile web add <绝对路径>`（不加 `file:` 前缀）会被 pnpm 记成
+`link:`，而 **`link:` 不会安装该包的依赖**。本插件生成的 `lib/typert.host.js`
+里有 `import { z } from 'zod'`，`link:` 之后插件目录不在 profile 的 `node_modules`
+之下，zod 永远解析不到，于是：
+
+```
+typert-loader: dsh-token-usage exports "./typert" but importing ... failed:
+  Cannot find package '.../node_modules/zod/index.js'
+```
+
+而 typert-loader 只要有一个 contributor 注册失败，**整轮注册都会中止** ——
+后果不是插件单独失效，而是所有 Remote 端点都失去 strict 定义，DSH 界面会整体崩掉
+（工作区列表空白、目录选择器报
+`directoryPicker/pick: its strict definition was withdrawn and SRC fallback is forbidden`）。
+数据不会丢，`~/.dsh/storages/workspace.json` 和会话日志都还在，移除该依赖重启即可恢复。
+
+要确认装对了，可以在装完后跑一次（把路径换成 profile 里的安装副本）：
+
+```sh
+node -e "import('file:///C:/Users/<你>/.dsh/profiles/web/node_modules/dsh-token-usage/lib/typert.host.js').then(m => console.log(m.TYPERT))"
+```
+
+打印出 `TYPERT` 对象就算通过；报 zod 找不到就是装成了 `link:`，卸掉重装。
+
 ### 从 0.1.x 升级
 
 1. 若 `~/.dsh/profiles/web/package.json` 里已有一条旧的 `dsh-token-usage` 依赖，
-   先 `dsh plugin --profile web remove dsh-token-usage`，再按上面重新安装。
+   先 `dsh plugin --profile web remove dsh-token-usage`，再按上面重新安装
+   （注意用 `file:` 前缀，见下面的警告）。
 2. 若 profile 配置（`cordis.yml` / `cordis.patch.yml` / `--patch`）里有 `name` 为
    `@deepseek-ai/dsh-invariants` 或以 `/invariant` 结尾的行，请删掉 —— DSH
    v0.2.0-rc.2 起不再发布 `invariants` 服务与任何 `<包>/invariant` 子路径。
