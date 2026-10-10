@@ -37,7 +37,10 @@ DSH 刚发布，大家最关心的就是：**我的 Token 到底花哪去了？*
 
 ## 安装
 
-需要 DSH **0.2.1 及以上**。插件依赖 DSH 内置包（`@deepseek-ai/*`），运行时由 DSH 自己解析，无需额外构建。
+需要 DSH **0.2.0-rc.2 或 0.2.1 系列**（含 `0.2.0-rc.2`、`0.2.1-alpha.x` 等预发布版），即
+`peerDependencies` 声明的 `>=0.2.0-0 <0.3.0`（`@deepseek-ai/cordis` 为 `>=4.0.4`）。
+桌面版与源码编译版都落在这个区间内。插件依赖 DSH 内置包（`@deepseek-ai/*`），运行时由 DSH
+自己解析，无需额外构建，也**不需要**用 `dsh plugin allow-version` 开兼容性豁免。
 
 ### 方式一：直接从 GitHub 安装（推荐）
 
@@ -142,6 +145,56 @@ node -e "import('file:///C:/Users/<你>/.dsh/profiles/web/node_modules/dsh-token
 > **0.1.x 的老装法已废弃**：以前是把源码拷进 `<deepseek-harness>/packages/extensions/`
 > 再跑 `pnpm run build:lib`。DSH 更新会覆盖仓库目录，拷进去的文件随之丢失，插件于是"失效"。
 > 请改用上面的 profile 安装方式，它写在 `~/.dsh/profiles/` 下，不受 DSH 更新影响。
+
+### 装不上：`installation rejected: ... is incompatible with dsh <版本>`
+
+安装时 DSH 会拿插件 `package.json` 里的 `peerDependencies` 与当前运行时版本做
+semver 比对，不满足就整单拒绝并回滚（日志里还会附带一句 pnpm 的 `allowBuilds` 提示
+—— 本仓库没有 `prepare` 脚本，那句是通用提示，不是实际原因）：
+
+```
+dsh: installation rejected: Plugin dsh-token-usage@<插件版本> is incompatible with dsh <运行时版本>:
+peerDependencies {"@deepseek-ai/dsh-client-connection":"...","@deepseek-ai/dsh-session":"..."}
+```
+
+处理顺序：
+
+1. **优先升级插件**：`0.2.1` 起本插件的 peer 范围是 `>=0.2.0-0 <0.3.0`，桌面版
+   `0.2.0-rc.2` 与源码版 `0.2.1-alpha.x` 都满足。装最新代码即可：
+   `dsh plugin --profile desktop add github:gaodayihao/dsh-token-usage`
+   （已在跑旧版则先 `remove`，或改用 `update`。）
+2. **确认运行时版本**：`dsh --version`（桌面版在 设置 → 通用 里也能看到）。若你的版本
+   不在 `>=0.2.0-0 <0.3.0` 内，请提 issue，不要靠豁免硬装。
+3. **只有确认过风险才用豁免**：exemption 只对「精确的插件版本 + 精确的 DSH 版本」生效，
+   升级插件或升级 DSH 后都会失效，需要重新授权。它不改变依赖，只是放行：
+
+   ```sh
+   dsh plugin --profile desktop allow-version dsh-token-usage@<插件版本> \
+     --dsh-version <运行时版本> --accept-risk
+   ```
+
+   撤销用 `revoke-version`，查看已授权列表用 `version-exemptions`。豁免记录写在 profile 的
+   `compatibility.json` 里。
+
+> 旧版本（`0.2.0`）声明的是 `^0.2.1-alpha.1`，在桌面版 `0.2.0-rc.2` 上会被这道闸门拦下。
+> 注意 `0.2.0-rc.2 < 0.2.1-alpha.1`，所以「0.2.1 的预发布」并不覆盖「0.2.0 的预发布」——
+> 想在两类运行时上通用，下界必须写到 `0.2.0-0` 这种带预发布的形式。
+>
+> 另外：`github:` / tarball 这类规格是**先装、再校验**兼容性，判定不通过时才回滚——所以你会
+> 在日志里看到 `dsh: restored package.json, pnpm-lock.yaml, and node_modules.`。registry 与
+> 本地路径规格则是**先校验、后安装**（不通过就什么都不装）。两者最终都不影响仓库，重装即可。
+
+### 装完报 `allowBuilds` / 构建被 pnpm 挂起
+
+本仓库**提交了构建产物 `lib/`**，且 `package.json` 里**没有 `prepare` / `preinstall` /
+`postinstall`**，pnpm 不会执行任何构建，也不会留下待审批的 `allowBuilds` 条目 ——
+所以**不需要**往 profile 的 `pnpm-workspace.yaml` 加任何东西。
+
+那句 `allowBuilds` 提示的实际触发条件是「`pnpm add` 退出码非 0 **且** 安装规格看起来像
+git 地址（`git+` / `github:` / `.git`）」—— 它是一条通用提示，**不是**「pnpm 真的挂起了
+构建」的证据。上面那种兼容性拒绝会让整单失败，于是这条提示也会跟着出现（你看到的日志
+就是这种情况）。真正的「构建被挂起」是另一个机制：安装失败类型 `build-blocked` 加
+`pendingBuilds` 列表，由插件管理器单独上报。
 
 ## 使用
 

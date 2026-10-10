@@ -1,6 +1,6 @@
 {
   "name": "dsh-token-usage",
-  "version": "0.2.0",
+  "version": "0.2.1",
   "description": "DSH Token 用量统计面板（Codex 风格）：全实例 Token 消耗汇总 + 活动热力图。",
   "type": "module",
   "main": "lib/types/index.js",
@@ -74,11 +74,11 @@
     "zod": "^4.4.3"
   },
   "peerDependencies": {
-    "@deepseek-ai/cordis": "~4.0.5-alpha.1",
-    "@deepseek-ai/dsh-client-connection": "^0.2.1-alpha.1",
-    "@deepseek-ai/dsh-session": "^0.2.1-alpha.1",
-    "@deepseek-ai/dsh-session-persistence": "^0.2.1-alpha.1",
-    "@deepseek-ai/dsh-typert-protocol": "^0.2.1-alpha.1",
+    "@deepseek-ai/cordis": ">=4.0.4",
+    "@deepseek-ai/dsh-client-connection": ">=0.2.0-0 <0.3.0",
+    "@deepseek-ai/dsh-session": ">=0.2.0-0 <0.3.0",
+    "@deepseek-ai/dsh-session-persistence": ">=0.2.0-0 <0.3.0",
+    "@deepseek-ai/dsh-typert-protocol": ">=0.2.0-0 <0.3.0",
     "react": "^18.2.0"
   }
 }

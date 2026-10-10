@@ -37,7 +37,7 @@ This plugin adds a token-usage stats panel to the DSH web UI, aggregating token 
 
 ## Installation
 
-Requires DSH **0.2.1 or newer**. The plugin depends on DSH's built-in packages (`@deepseek-ai/*`), which the runtime resolves itself — there is nothing extra to build.
+Requires DSH **0.2.0-rc.2 or the 0.2.1 line** (any `0.2.0-rc.2` / `0.2.1-alpha.x` prerelease included) — the declared `peerDependencies` range is `>=0.2.0-0 <0.3.0` with `@deepseek-ai/cordis` at `>=4.0.4`. Both the Desktop build and a source checkout fall inside it. The plugin depends on DSH's built-in packages (`@deepseek-ai/*`), which the runtime resolves itself — there is nothing extra to build, and you do **not** need a `dsh plugin allow-version` compatibility exemption.
 
 ### Option 1: Install straight from GitHub (recommended)
 
@@ -138,6 +138,58 @@ A printed `TYPERT` object means it works; "cannot find zod" means it went in as 
 > **The 0.1.x method is gone**: copying the source into `<deepseek-harness>/packages/extensions/` and running
 > `pnpm run build:lib` loses those files on every DSH update. The profile installation above lives under
 > `~/.dsh/profiles/` and survives DSH updates.
+
+### "installation rejected: ... is incompatible with dsh <version>"
+
+On install, DSH compares the plugin's `peerDependencies` against the running dsh version with semver and
+rejects (and rolls back) the whole operation when a range does not match. The log also appends a generic
+pnpm `allowBuilds` hint — this repository has no `prepare` script, so that hint is not the real cause:
+
+```
+dsh: installation rejected: Plugin dsh-token-usage@<plugin version> is incompatible with dsh <runtime version>:
+peerDependencies {"@deepseek-ai/dsh-client-connection":"...","@deepseek-ai/dsh-session":"..."}
+```
+
+What to do, in order:
+
+1. **Upgrade the plugin first.** Since `0.2.1` its peer range is `>=0.2.0-0 <0.3.0`, which both the Desktop
+   runtime (`0.2.0-rc.2`) and a source checkout (`0.2.1-alpha.x`) satisfy. Install the current code:
+   `dsh plugin --profile desktop add github:gaodayihao/dsh-token-usage`
+   (if an older version is already installed, `remove` it first, or use `update`).
+2. **Check the runtime version** with `dsh --version` (the Desktop app also shows it under Settings → General).
+   If it falls outside `>=0.2.0-0 <0.3.0`, please file an issue instead of forcing an exemption.
+3. **Use an exemption only after accepting the risk.** An exemption applies to one exact plugin version plus
+   one exact DSH version; upgrading either invalidates it. It changes no dependency, it only lets the install
+   through:
+
+   ```sh
+   dsh plugin --profile desktop allow-version dsh-token-usage@<plugin version> \
+     --dsh-version <runtime version> --accept-risk
+   ```
+
+   Revoke with `revoke-version`, list grants with `version-exemptions`. Grants are stored in the profile's
+   `compatibility.json`.
+
+> The older `0.2.0` release declared `^0.2.1-alpha.1` and is refused by that gate on Desktop `0.2.0-rc.2`.
+> Note that `0.2.0-rc.2 < 0.2.1-alpha.1`: "a 0.2.1 prerelease" does not cover "a 0.2.0 prerelease", so a range
+> that works on both runtimes must put its lower bound at a prerelease of `0.2.0`, such as `0.2.0-0`.
+>
+> Also worth knowing: a `github:` or tarball spec is **installed first and checked afterwards**, and only then
+> rolled back — which is why such a log also shows `dsh: restored package.json, pnpm-lock.yaml, and node_modules.`
+> A registry spec or a local path is **checked before anything is installed** (a rejection installs nothing).
+> Neither outcome touches the repository; just install again.
+
+### Install asks for `allowBuilds` / pnpm suspends a build
+
+This repository **commits its build output (`lib/`)** and its `package.json` declares **no `prepare`,
+`preinstall`, or `postinstall`**, so pnpm runs no build and leaves no pending `allowBuilds` entry —
+there is **nothing** to add to the profile's `pnpm-workspace.yaml`.
+
+That `allowBuilds` sentence is emitted whenever `pnpm add` exits non-zero **and** the install spec merely
+looks like a git URL (`git+`, `github:`, `.git`). It is a generic hint, **not** evidence that pnpm actually
+suspended a build: any failing install of a git spec prints it, including the compatibility rejection above
+(which is exactly what happened in that log). A genuinely suspended build is a different signal — install
+failure kind `build-blocked` plus a `pendingBuilds` list, reported separately by the plugin manager.
 
 ## Usage
 
