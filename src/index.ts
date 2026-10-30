@@ -193,6 +193,13 @@ function fallbackStorePath(): string {
   return join(dshHome(), 'storages', 'dsh-token-usage', `session-rollup.v${FALLBACK_STORE_VERSION}.json`)
 }
 
+/** 兼容旧版持久化句柄的读取返回形状：对象 { events } 或直接事件数组。 */
+function eventsOf(result: unknown): SessionEvent[] {
+  if (Array.isArray(result)) return result as SessionEvent[]
+  const events = (result as { events?: unknown } | null | undefined)?.events
+  return Array.isArray(events) ? (events as SessionEvent[]) : []
+}
+
 /** 日志 revision 是否可复用（两个 revision 都非空且相等）。 */
 function sameRevision(left: unknown, right: unknown): boolean {
   return typeof left === 'string' && typeof right === 'string' && left !== '' && left === right
@@ -480,8 +487,7 @@ export class TokenUsageService extends TypertRemoteService {
     if (!id) return
     const handle = await sp.open(id, 'read')
     try {
-      const result = await handle.read(0)
-      const events = Array.isArray(result?.events) ? result.events : []
+      const events = eventsOf(await handle.read(0))
       const header = (handle.header ?? entry.header) as { createdAt?: number } | undefined
       const inherited = typeof handle.inheritedEventCount === 'number' ? handle.inheritedEventCount : 0
       let value: unknown
@@ -612,8 +618,7 @@ export class TokenUsageService extends TypertRemoteService {
     if (persistence === null) return
     const handle = await persistence.open(id, 'read')
     try {
-      const result = await handle.read(0)
-      const events = Array.isArray(result?.events) ? result.events : []
+      const events = eventsOf(await handle.read(0))
       const resolvedHeader = (handle.header ?? header) as { createdAt?: number } | undefined
       let state = createSessionState(resolvedHeader)
       for (const event of events) state = applySessionEvent(state, event)
