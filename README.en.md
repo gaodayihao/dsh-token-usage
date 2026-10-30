@@ -24,7 +24,10 @@ This plugin adds a token-usage stats panel to the DSH web UI, aggregating token 
 - **Activity insights (incl. top model) + top 5 plugins / skills**: see who is burning the most at a glance
 - **Two native entry points**, blended into the DSH UI:
   - "Token 统计" button at the bottom of the sidebar (always available)
-  - Live usage capsule in the session header: `⚡ 2.61亿` (auto-refreshes every 5s)
+  - Live usage capsule in the session header: `⚡ 2.61亿` (5s while the panel is open, low-frequency when closed)
+- **Incremental statistics, zero log decompression on warm start**: per-session aggregates are
+  persisted in DSH's projection cache, so a restart only reads one cache row per session;
+  only uncached sessions pay a one-time cold read
 - **Deep-space purple dual theme**, follows the system / manual toggle
 
 ![Where the entries are: sidebar button + session-header ⚡ capsule](./docs/screenshot-entries.png)
@@ -146,44 +149,72 @@ A printed `TYPERT` object means it works; "cannot find zod" means it went in as 
 3. Click either entry to open the panel; toggle theme / close from the top-right
 4. The heatmap supports three views + hover tooltips for daily / weekly / cumulative values
 
-Data refreshes every 5 seconds; history is backfilled automatically and survives restarts.
+While the panel is open it refreshes every 5 seconds; closed, it drops to 60 seconds (the
+capsule keeps data). Opening the panel triggers an immediate refresh.
+
+The first install needs one background backfill: the heatmap title shows "统计中 312/907"
+until every session has been covered, then the badge disappears. Backfill runs newest-first,
+with bounded concurrency, and never blocks DSH's main flow. After that, restarts do not
+decompress any historical log — each session's aggregate lives in DSH's projection cache
+(`~/.dsh/storages/session_projcache/`).
 
 ## Data accounting
 
 Consistent with DSH's built-in token-meter:
 
-- One usage record per step: `assistant/chunk {type:'usage'}` is the durable record; `assistant/message.usage` replaces the chunk record for the same step (no double counting)
+- One usage settlement per step: `assistant/message.usage` is authoritative;
+  `assistant/attempt` contributes the last usage sample embedded in its stream (the real cost of a
+  retried attempt); `llm/retry-started` resets the dedupe slot so a retried settlement replaces
+  rather than double-counts the same step
+- Legacy v3 logs' `assistant/chunk {type:'usage'}` is still folded (v4 logs no longer emit it)
 - Total tokens = input + output + cacheRead + cacheWrite
-- Thinking level is approximated from `reasoningTokens`; skill stats are parsed from `skill` tool call arguments
+- Thinking level prefers `request/header`'s `reasoningEffort` (the level DSH actually sent) and
+  falls back to a `reasoningTokens` approximation only for old logs without that event; skill
+  stats are parsed from `skill` tool call arguments
 
 ## Architecture
 
 ```
-┌─ Host (inside the DSH process) ──────────────────┐
-│ TokenUsageService (TypertRemoteService)          │
-│  ├─ Backfills all historical sessions at boot    │
-│  ├─ Folds session/event live                     │
-│  └─ @Remote('getStats') → /api/tokenUsage/getStats
-└──────────────┬───────────────────────────────────┘
+┌─ Host (inside the DSH process) ─────────────────────────────────────┐
+│ TokenUsageService (TypertRemoteService)                             │
+│  ├─ dtsUsage projection unit (bounded per-session aggregate)        │
+│  ├─ Boot: sessionProjectionCache.cachedSnapshot() → zero log I/O   │
+│  ├─ Miss: coldSnapshot() reads the log once and writes back         │
+│  ├─ Live: sessionProjections.onChanged → in-memory rollup           │
+│  ├─ No projection services? self-persisted rollup + log revision    │
+│  └─ @Remote('getStats') → /api/tokenUsage/getStats                  │
+└──────────────┬──────────────────────────────────────────────────────┘
                │ connection.rpc (generic channel, no DSH edits)
-┌─ Browser ────▼───────────────────────────────────┐
-│  ├─ sidebar.footer.action        sidebar entry   │
-│  ├─ conversation.session.header.actions ⚡ capsule│
-│  └─ shell.overlay                panel modal     │
-└──────────────────────────────────────────────────┘
+┌─ Browser ────▼──────────────────────────────────────────────────────┐
+│  ├─ sidebar.footer.action        sidebar entry                     │
+│  ├─ conversation.session.header.actions ⚡ capsule                  │
+│  └─ shell.overlay                panel modal                        │
+└────────────────────────────────────────────────────────────────────┘
 ```
 
 | File | Purpose |
 |---|---|
-| `src/index.ts` | Host half: aggregation logic + Typert Remote |
-| `src/client/index.ts` | Browser half: panel UI + two entry points + 5s polling |
-| `src/types.ts` | Cross-plane wire types |
+| `src/index.ts` | Host half: projection unit / cache reads / cold backfill / fallback persistence + Typert Remote |
+| `src/aggregate.ts` | Pure aggregation (no DSH runtime): `createSessionState` / `applySessionEvent` / `sessionView` / `buildGlobalSnapshot` |
+| `src/client/index.ts` | Browser half: panel UI + two entry points + progress badge + adaptive polling |
+| `src/types.ts` | Cross-plane wire types (incl. `backfill` progress) |
+| `scripts/build-lib.mjs` | Generates `lib/` from `src/` (Node 24 type stripping, no DSH toolchain) |
 | `cordis.patch.yml` | Bundle patch: inserts the plugin row |
 | `lib/` | Committed build artifacts (runs as-is, no build needed) |
 
 ## Development
 
-`lib/` ships prebuilt — **regular users don't need to build**. To change code, the build pipeline needs the DSH repo's toolchain (tsc + tsdown + Typert generator): put `src/` under the DSH repo's `packages/extensions/dsh-token-usage/`, build there, and sync the resulting `lib/` back to this repo.
+`lib/` ships prebuilt — **regular users don't need to build**. To change code, use the bundled builder:
+
+```sh
+node scripts/build-lib.mjs          # regenerate lib/types/*.js and lib/client.js
+node scripts/build-lib.mjs --check  # verify lib/ is in sync with src/
+```
+
+It uses Node 24's `module.stripTypeScriptTypes` for type-only compilation, so no DSH
+toolchain (tsc/tsdown) is required. Two generated artifacts are maintained by hand:
+`lib/typert.host.js` / `lib/typert.remote-client.js` (Typert strict result schemas — the
+build script checks that `backfill` is present) and the `.d.ts` declarations.
 
 ### Releasing (maintainers)
 
@@ -195,10 +226,10 @@ A GitHub install serves **committed files**, so every release must:
 3. Tag and push so users can pin a version:
 
    ```sh
-   git tag v0.2.0 && git push origin main --tags
+   git tag v0.3.0 && git push origin main --tags
    ```
 
-4. Verify once in a clean environment: `dsh plugin --profile web add "github:gaodayihao/dsh-token-usage#v0.2.0"`.
+4. Verify once in a clean environment: `dsh plugin --profile web add "github:gaodayihao/dsh-token-usage#v0.3.0"`.
 
 ## License
 

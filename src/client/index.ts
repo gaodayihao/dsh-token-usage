@@ -25,7 +25,41 @@ import type {} from '@deepseek-ai/dsh-client-ui-layout/client'
 import type { SidebarFooterActionOwnerProps } from '@deepseek-ai/dsh-client-ui-sidebar/client'
 import type {} from '@deepseek-ai/dsh-client-ui-sidebar/client'
 import type {} from '@deepseek-ai/dsh-client-ui-conversation/client'
-import type { TokenUsageSnapshot } from '../types.ts'
+import type { BackfillPhase, BackfillProgress, TokenUsageSnapshot } from '../types.ts'
+
+/* ── backfill 进度（host 投影缓存 + 增量聚合的首次安装回填） ──────────────── */
+/** 兼容视图：backfill 在 wire 类型里必填，但旧 host / 旧快照可能整体缺失或只给部分字段。 */
+type SnapshotView = Omit<TokenUsageSnapshot, 'backfill'> & { backfill?: Partial<BackfillProgress> | null }
+/** 回填进度缺省值：数据未到或老 host 不返回 backfill 时的兜底。 */
+const DEFAULT_BACKFILL: BackfillProgress = {
+  phase: 'idle',
+  done: 0,
+  total: 0,
+  fromCache: 0,
+  coldReads: 0,
+  mode: 'projection',
+}
+const BACKFILL_PHASES: BackfillPhase[] = ['idle', 'scanning', 'backfilling', 'ready', 'fallback']
+/**
+ * 读取快照里的回填进度：旧快照没有 backfill（或字段类型不符）时逐项回退到
+ * 缺省值，保证面板 / 胶囊在纯老数据下照常渲染、不抛错。
+ */
+function backfillOf(s: TokenUsageSnapshot | null): BackfillProgress {
+  const raw = s ? (s as SnapshotView).backfill : null
+  if (!raw || typeof raw !== 'object') return { ...DEFAULT_BACKFILL }
+  const num = (v: unknown): number => (typeof v === 'number' && Number.isFinite(v) ? v : 0)
+  const phase: BackfillPhase = typeof raw.phase === 'string' && (BACKFILL_PHASES as string[]).includes(raw.phase)
+    ? raw.phase as BackfillPhase
+    : DEFAULT_BACKFILL.phase
+  return {
+    phase,
+    done: num(raw.done),
+    total: num(raw.total),
+    fromCache: num(raw.fromCache),
+    coldReads: num(raw.coldReads),
+    mode: raw.mode === 'fallback' ? 'fallback' : 'projection',
+  }
+}
 
 /* ── module-scope store ──────────────────────────────────────────────────── */
 let latest: TokenUsageSnapshot | null = null
@@ -378,7 +412,7 @@ const PANEL_CSS = `
 .plugin-count { color: var(--text-faint); font-size: 12px; font-variant-numeric: tabular-nums; }
 `
 
-/** 空快照兜底：数据尚未到达时渲染零值骨架，UI 结构不阻断。 */
+/** 空快照兜底：数据尚未到达时渲染零值骨架，UI 结构不阻断（backfill 用缺省值）。 */
 const EMPTY_SNAPSHOT: TokenUsageSnapshot = {
   totalConversations: 0,
   totalMessages: 0,
@@ -400,6 +434,7 @@ const EMPTY_SNAPSHOT: TokenUsageSnapshot = {
   earliestDate: '',
   latestDate: '',
   updatedAt: 0,
+  backfill: { ...DEFAULT_BACKFILL },
 }
 
 /** 解析当前主题（面板与入口统一口径）。 */
@@ -437,12 +472,18 @@ function SidebarStatsEntry({ wide }: SidebarFooterActionOwnerProps): React.React
 function HeaderStatsCapsule(): React.ReactElement {
   const data = React.useSyncExternalStore(subscribe, getSnapshot)
   const open = React.useSyncExternalStore(subscribeOpen, getOpen)
+  // title 顺带展示回填进度（不改视觉，只改悬浮文案）。
+  const bf = backfillOf(data)
+  const bfProgress = bf.total > 0 ? ` ${Math.min(bf.done, bf.total)}/${bf.total}` : ''
+  const capsuleTitle = bf.phase === 'ready'
+    ? 'Token 统计 · 点击查看详情'
+    : `Token 统计 · 回填中${bfProgress} · 点击查看详情`
   return h('div', { className: 'dts-root dts-entry-scope', 'data-theme': resolvedThemeOf() },
     h('button', {
       className: 'dts-header-capsule' + (open ? ' active' : ''),
       type: 'button',
       onClick: (): void => setOpen(true),
-      title: 'Token 统计 · 点击查看详情',
+      title: capsuleTitle,
       'aria-label': 'Token 统计',
     },
       h(Icon, { name: 'zap', size: 12 }),
@@ -575,8 +616,9 @@ function TokenStatsPanel(): React.ReactElement | null {
   if (!open) return null
 
   // 数据未到：整面板骨架照常渲染（零值），"统计中"标记由 Heatmap 标题旁徽标表达。
+  // 老 host 不返回 backfill 时 backfillOf 逐项兜底，面板与胶囊都不崩。
   const s = data ?? EMPTY_SNAPSHOT
-  const loading = data === null
+  const bf = backfillOf(data)
   const fetchedAt = new Date()
   const hm = String(fetchedAt.getHours()).padStart(2, '0')
   const mm = String(fetchedAt.getMinutes()).padStart(2, '0')
@@ -736,7 +778,7 @@ function TokenStatsPanel(): React.ReactElement | null {
       h('div', { className: 'dts-user-sub' }, userSub),
     ),
     metrics,
-    h(Heatmap, { data, hmMode, setHmMode, tip, setTip, loading }),
+    h(Heatmap, { data, hmMode, setHmMode, tip, setTip, backfill: bf }),
     h('div', { className: 'dts-bottom' }, insight, pluginCol),
   )
 
@@ -758,12 +800,17 @@ interface HeatmapProps {
   setHmMode: (mode: HmMode) => void
   tip: TipState | null
   setTip: (tip: TipState | null) => void
-  /** 首轮数据尚未到达：显示"统计中"徽标而不阻断 UI。 */
-  loading: boolean
+  /** 首次安装后台回填进度：phase 未到 ready 时在标题旁显示进度徽标。 */
+  backfill: BackfillProgress
 }
 
-function Heatmap({ data, hmMode, setHmMode, tip: _tip, setTip, loading }: HeatmapProps): React.ReactElement {
+function Heatmap({ data, hmMode, setHmMode, tip: _tip, setTip, backfill }: HeatmapProps): React.ReactElement {
   const daily = (data && data.dailyTokens) || {}
+  // 首轮数据未到 或 后台回填未到 ready：标题旁显示"统计中 [done/total]"徽标。
+  const backfillPending = data === null || backfill.phase !== 'ready'
+  const bfProgress = backfill.total > 0 ? `${Math.min(backfill.done, backfill.total)}/${backfill.total}` : ''
+  const badgeText = bfProgress ? `统计中 ${bfProgress}` : '统计中'
+  const badgeTitle = bfProgress ? `正在统计 Token 用量：已回填 ${bfProgress}` : '正在统计 Token 用量…'
   const today = new Date()
   const start = new Date(today.getFullYear(), today.getMonth() - 11, 1)
   start.setDate(start.getDate() - start.getDay())
@@ -943,8 +990,8 @@ function Heatmap({ data, hmMode, setHmMode, tip: _tip, setTip, loading }: Heatma
   return h('div', { className: 'dts-heatmap' },
     h('div', { className: 'hm-header' },
       h('div', { className: 'hm-title' }, 'Token 活动',
-        loading ? h('span', { className: 'dts-loading-badge', title: '正在统计 Token 用量…' },
-          h('span', { className: 'dts-loading-dot' }), '统计中') : null),
+        backfillPending ? h('span', { className: 'dts-loading-badge', title: badgeTitle },
+          h('span', { className: 'dts-loading-dot' }), badgeText) : null),
       h('div', { className: 'hm-tabs' },
         (['daily', 'weekly', 'cumulative'] as HmMode[]).map(mode => h('button', {
           key: mode,
@@ -1003,10 +1050,21 @@ export function apply(ctx: ClientContext): void {
   }
 
   ctx.effect(() => {
-    void refresh()
-    const timer = setInterval(() => {
+    // 轮询降频：固定 5s tick，但面板关闭时按 60s 节流（胶囊仍保留数据）；
+    // 面板打开瞬间（subscribeOpen / setOpen 链路）补一次立即 refresh，随后恢复 5s。
+    const TICK_MS = 5000
+    const IDLE_REFRESH_MS = 60000
+    let lastRefreshAt = 0
+    const refreshNow = (): void => {
+      lastRefreshAt = Date.now()
       void refresh()
-    }, 5000)
+    }
+    refreshNow()
+    const timer = setInterval(() => {
+      const panelVisible = getOpen()
+      if (Date.now() - lastRefreshAt < (panelVisible ? TICK_MS : IDLE_REFRESH_MS)) return
+      refreshNow()
+    }, TICK_MS)
     // 面板模态框：shell.overlay（list 座位，独立 id）。
     const disposeOverlay = ctx.slots.inject('shell.overlay', () => ctx.slots.register(
       { name: 'shell.overlay', id: 'token-usage', order: 100, label: 'Token 统计' },
@@ -1022,8 +1080,16 @@ export function apply(ctx: ClientContext): void {
       { name: 'conversation.session.header.actions', id: 'token-usage-header', order: 90 },
       HeaderStatsCapsule,
     ))
+    // 面板从关闭 -> 打开的边沿立即刷新一次（打开状态下保持 5s 节奏）。
+    let wasOpen = getOpen()
+    const disposeOpenWatch = subscribeOpen(() => {
+      const isOpen = getOpen()
+      if (isOpen && !wasOpen) refreshNow()
+      wasOpen = isOpen
+    })
     return () => {
       clearInterval(timer)
+      disposeOpenWatch()
       if (typeof disposeOverlay === 'function') disposeOverlay()
       if (typeof disposeSidebar === 'function') disposeSidebar()
       if (typeof disposeHeader === 'function') disposeHeader()

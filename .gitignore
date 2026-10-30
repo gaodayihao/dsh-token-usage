@@ -2,6 +2,8 @@ node_modules/
 *.tsbuildinfo
 *.log
 .DS_Store
+# 验证脚本的临时输出（会话解码缓存、假 DSH_HOME）
+scripts/verify/out/
 # 本地开发同步脚本（含本机路径，不提交）
 scripts/dev-sync.sh
 # 安装前对本机 DSH profile 配置做的备份（含本机路径，不提交）

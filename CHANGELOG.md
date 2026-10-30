@@ -1,5 +1,51 @@
 # Changelog
 
+## [0.3.0] - 2026-10-30
+
+统计架构重写：从“每次启动全量解析所有会话日志 + 常驻每步明细”改为
+“DSH 投影缓存 + 增量折叠 + 内存 rollup”，并保留老 DSH 的自持久化兜底。
+
+### Changed
+
+- **增量与持久化（B 方案）**：host 半边注册 `dtsUsage` session 投影单元
+  （有界会话聚合 + 带 wire view），由 DSH 的 `sessionProjections` 按事件增量驱动、
+  `sessionProjectionCache` 按 `(sessionId, seq)` 持久化；启动时逐会话
+  `cachedSnapshot()` 零日志 I/O 读缓存行，只有缓存未命中的会话才冷读一次原始日志并
+  写回 checkpoint。之后冷启动不再解压任何历史日志。
+- **内存与快照成本解耦**：不再保留每 step 的 usage 明细，改为每会话有界状态
+  （四类 token 桶、按天桶、thinking/模型/工具/skill 计数、消息时间线标量）；
+  `getStats` 从 O(总 step 数) 的全量重算改为 O(会话数) 的 rollup 合并，并加
+  dirty + 1s 节流缓存。
+- **首次回填进度**：新增 wire 字段 `backfill`（phase/done/total/fromCache/
+  coldReads/mode），面板在热力图标题旁显示“统计中 x/y”，回填完成后自动隐藏；
+  回填按会话创建时间从新到旧、限并发、每批让出事件循环，不阻塞 DSH 主流程。
+- **轮询降频**：浏览器半边改为固定 5s tick，但面板关闭时 60s 才真正 RPC
+  （会话头部 ⚡ 胶囊仍保留数据），面板打开瞬间立即刷新一次。
+- **折叠语义对齐 DSH token-meter**：`assistant/message` 的 usage 为权威结算，
+  `assistant/attempt` 取 stream 内最后一个 usage 样本，`llm/retry-started` 复位
+  去重槽；同一步的重复结算按替换记账，重试场景不再重复计数。
+  注：这是一次主动语义对齐 —— 当前语料里 459 个 attempt 的 usage 全为 0（重试失败），
+  所以数字与旧实现完全一致；若未来 provider 在失败 attempt 内返回非零 usage，新实现
+  会按 token-meter 口径把它计入，旧实现则忽略。
+- **兜底模式（A 方案）**：目标 DSH 没有投影/缓存服务时，插件把每会话聚合持久化到
+  `~/.dsh/storages/dsh-token-usage/session-rollup.v1.json`，用 `list()` 的
+  revision 判断“日志没变就不重读”。
+
+### Added
+
+- `src/aggregate.ts`：不依赖 DSH 运行时的纯聚合模块（投影单元 / 兜底回放 / 离线
+  对拍共用同一份 fold）。
+- `scripts/build-lib.mjs`：用 Node 24 的 `module.stripTypeScriptTypes` 从 `src/`
+  重新生成 `lib/`，不需要 DSH 仓库的 tsc/tsdown 工具链（`node scripts/build-lib.mjs`）。
+- `scripts/verify/`：独立参考实现 + 全量日志对拍 + 加载冒烟脚本。
+
+### Verified
+
+- 907 个真实会话日志全量对拍（旧实现 vs 新 fold）：token 四桶、按天桶、
+  thinking/模型/工具/skill 计数、消息数、最长聊天段、全局快照一致或差异可解释。
+- `lib/` 语法检查通过；`lib/typert.host.js` / `lib/typert.remote-client.js` 的
+  strict result schema 已同步 `backfill` 字段。
+
 ## [Unreleased]
 
 ### Changed

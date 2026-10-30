@@ -1,33 +1,39 @@
 /**
  * Token 统计面板 — Host 半边（Codex 风格）
  *
- * 仿照 Codex 个人用量页统计面板的数据口径，
- * 后端逻辑完全基于 DSH 原生数据：
- *  - Backfill：激活时通过 `ctx.sessionPersistence.list()` 枚举持久化 session，
- *    再经 `open(id, 'read')` + `handle.read()` 读取事件日志，
- *    从存储事件折叠 usage / 工具调用 / 消息时间线，面板覆盖历史。
- *  - Live：订阅 `session/event`，把同样的信号实时折叠进来。
- *  - RPC：`@Remote('getStats')` 把聚合快照通过 Typert Remote 暴露给浏览器半边
- *    （client 侧通过通用 RPC 通道调用 `tokenUsage/getStats`）。
+ * 数据链路（B 方案：DSH 投影缓存 + 增量折叠；A 方案兜底：插件自持久化）：
+ *  - 增量：注册一个带 wire view 的 session 投影单元（`dtsUsage`），DSH 的
+ *    `sessionProjections` 按事件增量驱动它，`sessionProjectionCache` 负责把
+ *    每个会话的有界聚合按 `(sessionId, seq)` 持久化到 `session_projcache`。
+ *    live 会话的更新通过 `sessionProjections.onChanged` 增量进入内存汇总。
+ *  - 冷启动：遍历 `sessionPersistence.list()`，逐会话 `cachedSnapshot()`
+ *    零日志 I/O 读缓存行；只有缓存未命中的会话才冷读一次原始日志
+ *    （`coldSnapshot()` 会顺带把新 checkpoint 写回），之后永久命中。
+ *  - 兜底：目标 DSH 没有投影/缓存服务时，插件自己把每会话聚合持久化到
+ *    `~/.dsh/storages/dsh-token-usage/session-rollup.v1.json`，用
+ *    `list()` 返回的 revision 做“没变就不重读”的增量判断。
+ *  - RPC：`@Remote('getStats')` 返回内存汇总的缓存快照（dirty + 1s 节流），
+ *    浏览器半边通过通用 RPC 通道调用 `tokenUsage/getStats`。
  *
- * 记账语义（与 token-meter 折叠一致）：
- *  - 每 step 一条 usage 记录，键为 `${sessionId}:${turn}:${step}`。
- *  - `assistant/chunk`（chunk.type === 'usage'）是每 step 的持久记录；
- *    `assistant/message` 携带 usage 时以同键覆盖 chunk 记录（last writer wins，
- *    不重复计数），并携带 `message.source.model`。
- *
- * 与 OpenClaw 版的差异：DSH 无火山平台真实总量（GLM）校准，累计 token 直接取
- * provider 返回的 usage（input + output + cacheRead + cacheWrite）；推理强度取
- * `request/header` 的 `header.config.reasoningEffort`（DSH 实际下发档位），
- * 仅在没有该事件的旧日志上回退 reasoningTokens 近似。
+ * 记账语义见 `./aggregate.ts`（对齐 DSH token-meter 的 tokenUsage 单元）：
+ * 每会话只保留有界聚合（四类 token 桶、按天桶、thinking/模型/工具/skill
+ * 计数、消息时间线标量），内存与“会话有多长”解耦；同一步的重复结算按替换
+ * 记账，不重复计数。
  * @module @deepseek-ai/dsh-token-usage
  */
 
-import { Context, Service } from '@deepseek-ai/cordis'
-import type { Session, SessionEvent, SessionId } from '@deepseek-ai/dsh-session'
-import type { SessionPersistence } from '@deepseek-ai/dsh-session-persistence'
+import { Service } from '@deepseek-ai/cordis'
+import type { Context } from '@deepseek-ai/cordis'
 import { Remote, TypertRemoteService } from '@deepseek-ai/dsh-typert-protocol'
-import type { ThinkingLevelCounts, TokenUsageSnapshot, TokenUsageFields } from './types.ts'
+import type { Session, SessionEvent } from '@deepseek-ai/dsh-session'
+import type { SessionPersistence } from '@deepseek-ai/dsh-session-persistence'
+import { z } from 'zod'
+import { mkdir, readFile, rename, writeFile } from 'node:fs/promises'
+import { homedir } from 'node:os'
+import { dirname, join } from 'node:path'
+import { applySessionEvent, buildGlobalSnapshot, createSessionState, sessionView } from './aggregate.ts'
+import type { SessionUnitState, SessionView } from './aggregate.ts'
+import type { BackfillProgress, TokenUsageSnapshot } from './types.ts'
 
 export type * from './types.ts'
 
@@ -37,464 +43,660 @@ declare module '@deepseek-ai/cordis' {
   }
 }
 
-const USAGE_FIELDS = [
-  'inputTokens',
-  'outputTokens',
-  'cacheReadTokens',
-  'cacheWriteTokens',
-] as const
+/** 投影单元 key（持久化在 session_projcache 的每会话记录里）。 */
+const UNIT_KEY = 'dtsUsage'
+/** 投影单元状态版本：折叠语义变化时 +1，旧行会被 DSH 视为不可用并重折。 */
+const UNIT_VERSION = 1
+/** 冷读日志时的并发度（单个大日志解压后几十 MB，别开太大）。 */
+const COLD_READ_CONCURRENCY = 2
+/** getStats 快照最短重算间隔（毫秒）。 */
+const SNAPSHOT_TTL_MS = 1000
+/** 等待 DSH 投影服务就绪的上限（毫秒），超时即走兜底模式。 */
+const SERVICE_WAIT_MS = 4000
+/** 兜底模式：日志 revision 未变则跳过重读。 */
+const FALLBACK_STORE_VERSION = 1
+const FALLBACK_FLUSH_DELAY_MS = 2000
 
-/** 每 step 折叠后的 usage 记录。 */
-interface StepRecord {
-  usage: TokenUsageFields
-  model: string | null
-  time: number
-  sessionId: string
-  /** 该 step 生效的推理强度（request/header 权威值；缺失时回退 tokens 近似）。 */
-  effort?: string
+/* ── 投影单元 schema（plain JSON，可被 DSH 持久化校验） ─────────────────── */
+
+const bucketsSchema = z.object({
+  inputTokens: z.number(),
+  outputTokens: z.number(),
+  cacheReadTokens: z.number(),
+  cacheWriteTokens: z.number(),
+})
+
+const thinkingSchema = z.object({
+  high: z.number(),
+  medium: z.number(),
+  low: z.number(),
+  off: z.number(),
+})
+
+const unitStateSchema = z.object({
+  createdAt: z.number(),
+  inputTokens: z.number(),
+  outputTokens: z.number(),
+  cacheReadTokens: z.number(),
+  cacheWriteTokens: z.number(),
+  days: z.record(z.string(), z.number()),
+  thinking: thinkingSchema,
+  models: z.record(z.string(), z.number()),
+  tools: z.record(z.string(), z.number()),
+  skills: z.record(z.string(), z.number()),
+  messageCount: z.number(),
+  lastMsgTime: z.number().nullable(),
+  segStart: z.number().nullable(),
+  maxSeg: z.number(),
+  effort: z.string().nullable(),
+  effortKnown: z.boolean(),
+  early: thinkingSchema,
+  last: z.object({
+    turn: z.number(),
+    step: z.number(),
+    day: z.string(),
+    total: z.number(),
+    buckets: bucketsSchema,
+  }).nullable(),
+})
+
+const unitViewSchema = z.object({
+  createdAt: z.number(),
+  totalTokens: z.number(),
+  inputTokens: z.number(),
+  outputTokens: z.number(),
+  cacheReadTokens: z.number(),
+  cacheWriteTokens: z.number(),
+  days: z.record(z.string(), z.number()),
+  thinking: thinkingSchema,
+  models: z.record(z.string(), z.number()),
+  tools: z.record(z.string(), z.number()),
+  skills: z.record(z.string(), z.number()),
+  messageCount: z.number(),
+  lastMsgTime: z.number().nullable(),
+  segStart: z.number().nullable(),
+  maxSeg: z.number(),
+})
+
+/* ── DSH 服务的结构化视图（只用到的方法，避免硬依赖内部类型包） ─────────── */
+
+interface ProjectionBlock {
+  asOfSeq?: number
+  values: Record<string, unknown>
 }
 
-/** 一个会话的消息时间线（>30min 间隔切分为段）。 */
-interface SessionMeta {
-  createdAt: number
-  messageCount: number
-  lastMsgTime: number | null
-  segStart: number | null
-  maxSeg: number
+interface ProjectionRegistryLike {
+  register(definition: unknown): unknown
+  onChanged?(listener: (session: Session, key: string, value: unknown, seq: number) => void): () => void
+  snapshot?(session: Session, keys?: string[]): ProjectionBlock | undefined
+  cachedSnapshot?(session: Session, keys?: string[]): ProjectionBlock | undefined
 }
 
-/** 全零计数（避免每次 snapshot 重新造对象）。 */
-function zeroCounts(): Record<(typeof USAGE_FIELDS)[number], number> {
-  return { inputTokens: 0, outputTokens: 0, cacheReadTokens: 0, cacheWriteTokens: 0 }
+interface ProjectionCacheLike {
+  cachedSnapshot(meta: unknown, keys?: string[]): ProjectionBlock | undefined
+  coldSnapshot(meta: unknown, inheritedEventCount: number, events: readonly unknown[]): ProjectionBlock | undefined
 }
 
-/** 每 step 记录键。 */
-function stepKey(sessionId: string, turn: number, step: number): string {
-  return `${sessionId}:${turn}:${step}`
+interface PersistenceEntry {
+  header?: { id?: string; createdAt?: number }
+  revision?: string
+  sizeBytes?: number
 }
 
-/** 时间戳 -> 'YYYY-MM-DD'。 */
-function dayKey(time: number): string {
-  const d = new Date(time)
-  const pad = (n: number): string => String(n).padStart(2, '0')
-  return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}`
+interface ReadHandleLike {
+  header?: unknown
+  inheritedEventCount?: number
+  read(offset?: number, length?: number): Promise<{ events: SessionEvent[] }>
+  close(): Promise<void>
+}
+
+interface SessionStoreLike {
+  list?(): Session[]
+}
+
+interface FallbackRecord {
+  revision: string
+  view: SessionView
+}
+
+interface FallbackStore {
+  version: number
+  sessions: Record<string, FallbackRecord>
+}
+
+/* ── 小工具 ─────────────────────────────────────────────────────────────── */
+
+function num(value: unknown): number {
+  return typeof value === 'number' && Number.isFinite(value) ? value : 0
+}
+
+function warn(message: string): void {
+  // 插件是 fail-soft 的：统计失败不应该影响 DSH 主流程。
+  console.warn(`[token-usage] ${message}`)
+}
+
+function yieldToEventLoop(): Promise<void> {
+  return new Promise(resolve => {
+    setImmediate(resolve)
+  })
+}
+
+/** DSH 数据根目录（`~/.dsh`，可用 DSH_HOME 覆盖）。 */
+function dshHome(): string {
+  const fromEnv = process.env.DSH_HOME
+  if (typeof fromEnv === 'string' && fromEnv.trim()) return fromEnv
+  return join(homedir(), '.dsh')
+}
+
+/** 兜底模式的本地持久化文件。派生数据，损坏/丢失只会导致一次全量回填。 */
+function fallbackStorePath(): string {
+  return join(dshHome(), 'storages', 'dsh-token-usage', `session-rollup.v${FALLBACK_STORE_VERSION}.json`)
+}
+
+/** 日志 revision 是否可复用（两个 revision 都非空且相等）。 */
+function sameRevision(left: unknown, right: unknown): boolean {
+  return typeof left === 'string' && typeof right === 'string' && left !== '' && left === right
 }
 
 /**
- * 连续活跃天数（按 'YYYY-MM-DD' 去重排序）：
- * 返回 [当前连续（含今天/昨天）、历史最长连续]。
- */
-function streakDays(dateStrings: readonly string[]): [number, number] {
-  const days = [...new Set(dateStrings)].sort()
-  if (days.length === 0) return [0, 0]
-  const dayObjs = days.map(d => new Date(`${d}T00:00:00`))
-  let longest = 1
-  let run = 1
-  for (let i = 1; i < dayObjs.length; i++) {
-    const gap = Math.round((dayObjs[i]!.getTime() - dayObjs[i - 1]!.getTime()) / 86400000)
-    if (gap === 1) {
-      run += 1
-      if (run > longest) longest = run
-    } else {
-      run = 1
-    }
-  }
-  const now = new Date()
-  const today = new Date(now.getFullYear(), now.getMonth(), now.getDate())
-  const latest = dayObjs[dayObjs.length - 1]!
-  const todayGap = Math.round((today.getTime() - latest.getTime()) / 86400000)
-  let current = 0
-  if (todayGap <= 1) {
-    current = 1
-    for (let i = dayObjs.length - 1; i > 0; i--) {
-      const gap = Math.round((dayObjs[i]!.getTime() - dayObjs[i - 1]!.getTime()) / 86400000)
-      if (gap === 1) current += 1
-      else break
-    }
-  }
-  return [current, longest]
-}
-
-/** 秒 -> "x天 y小时" / "x小时 y分" / "x分"。 */
-function fmtDuration(sec: number): string {
-  sec = Math.floor(sec)
-  if (sec <= 0) return '0分'
-  const h = Math.floor(sec / 3600)
-  const m = Math.floor((sec % 3600) / 60)
-  const d = Math.floor(h / 24)
-  if (d > 0) return `${d}天 ${h % 24}小时`
-  if (h > 0) return `${h}小时 ${m}分`
-  return `${m}分`
-}
-
-/** provider model id -> 短族名（Codex 词汇）。 */
-function modelFamily(model: string): string {
-  const m = model.toLowerCase()
-  if (m.includes('glm')) return 'GLM'
-  if (m.includes('deepseek')) return 'DeepSeek'
-  if (m.includes('gemini')) return 'Gemini'
-  if (m.includes('claude')) return 'Claude'
-  if (m.includes('kimi') || m.includes('k3')) return 'Kimi'
-  if (m.includes('doubao') || m.includes('seed')) return 'Doubao'
-  if (m.includes('qwen')) return 'Qwen'
-  if (m.includes('minimax')) return 'MiniMax'
-  if (m.includes('gpt')) return 'GPT'
-  if (m.includes('llama')) return 'Llama'
-  if (m.includes('mistral') || m.includes('codestral') || m.includes('devstral')) return 'Mistral'
-  if (m.includes('mimo')) return 'MiMo'
-  if (m.includes('command')) return 'Cohere'
-  return m || 'Other'
-}
-
-/** reasoningTokens -> thinking 等级近似（仅在无 request/header 权威值时兜底）。 */
-function thinkingLevel(reasoningTokens: number | undefined): keyof ThinkingLevelCounts {
-  const r = reasoningTokens || 0
-  if (r <= 0) return 'off'
-  if (r <= 2000) return 'low'
-  if (r <= 8000) return 'medium'
-  return 'high'
-}
-
-/**
- * DSH 权威推理强度 -> 面板四档。
- *
- * `request/header` 的 `header.config.reasoningEffort` 是 DSH 实际下发的档位，
- * 只在变化时落盘，因此取最近一次快照即为该 step 生效值。
- * 返回 undefined 表示档位未知（调用方回退 reasoningTokens 近似）。
- */
-function effortBucket(effort: string | undefined): keyof ThinkingLevelCounts | undefined {
-  if (!effort) return undefined
-  switch (effort.toLowerCase()) {
-    case 'off':
-    case 'none':
-      return 'off'
-    case 'low':
-    case 'minimal':
-      return 'low'
-    case 'medium':
-      return 'medium'
-    case 'high':
-    case 'xhigh':
-    case 'max':
-    case 'ultra':
-      return 'high'
-    default:
-      return undefined
-  }
-}
-
-/** DSH 核心工具集：其余工具视为"插件"。 */
-const CORE_TOOLS = new Set([
-  'bash', 'read', 'read_image', 'write', 'edit', 'glob', 'grep', 'todo_write', 'ask_user_question',
-  'subagent', 'subagent_fork', 'interrupt_agent', 'list_agents', 'send_message',
-  'job_kill', 'job_list', 'job_output',
-  'workflow', 'ralph', 'create_goal', 'get_goal', 'update_goal', 'exit_plan_mode',
-  'web_search', 'session_search', 'session_event_search', 'session_event_read', 'session_event_trace', 'session_trace',
-  'schedule_create', 'schedule_list', 'schedule_delete', 'skill',
-  'cordis_define', 'cordis_run', 'cordis_stop', 'cordis_undefine',
-  'cordis_inspect_list', 'cordis_inspect_query', 'cordis_inspect_self',
-  'mcp__reference_memory__read_graph', 'mcp__reference_memory__search_nodes',
-  'mcp__reference_memory__open_nodes', 'mcp__reference_memory__create_entities',
-  'mcp__reference_memory__add_observations', 'mcp__reference_memory__create_relations',
-  'mcp__reference_memory__delete_entities', 'mcp__reference_memory__delete_observations',
-  'mcp__reference_memory__delete_relations',
-])
-
-/**
- * 只读统计服务：跨全部持久化 session 聚合 token 用量并实时跟随，通过
+ * 只读统计服务：维护“每会话有界聚合 -> 全局汇总”的内存 rollup，并通过
  * Typert Remote 暴露给浏览器面板。不创建、不恢复任何 Agent / Session。
  */
 export class TokenUsageService extends TypertRemoteService {
   static inject = ['sessionPersistence']
 
-  /** stepUsage: key `${sessionId}:${turn}:${step}` -> 折叠后的 usage 记录。 */
-  private readonly stepUsage = new Map<string, StepRecord>()
-  /** foldedSeq: sessionId -> 已折叠的最高持久 seq（backfill/live 去重）。 */
+  /** sessionId -> 单会话视图（rollup 的唯一真相源）。 */
+  private readonly views = new Map<string, SessionView>()
+  /** 兜底模式：sessionId -> 折叠状态（live 继续折叠用）。 */
+  private readonly states = new Map<string, SessionUnitState>()
+  /** 兜底模式：sessionId -> 已折叠的最高 seq。 */
   private readonly foldedSeq = new Map<string, number>()
-  /** pending: sessionId -> 该 session backfill 完成前缓冲的 live 事件。 */
+  /** 兜底模式：本次扫描到的会话 id，用于区分“待冷读”与“启动后新建”。 */
+  private readonly listed = new Set<string>()
+  /** 兜底模式：冷读前缓冲的 live 事件。 */
   private readonly pending = new Map<string, SessionEvent[]>()
-  /** 一旦为 true，新 session 的 live 事件直接折叠（不再缓冲）。 */
-  private backfillDone = false
-  /** toolCounts: 工具名 -> 调用次数。 */
-  private readonly toolCounts = new Map<string, number>()
-  /** skillCounts: skill 名 -> 调用次数（从 'skill' 工具参数解析）。 */
-  private readonly skillCounts = new Map<string, number>()
-  /** sessionMeta: sessionId -> 消息时间线元数据。 */
-  private readonly sessionMeta = new Map<string, SessionMeta>()
-  /** currentEffort: sessionId -> 最近一次 request/header 生效的推理强度。 */
-  private readonly currentEffort = new Map<string, string>()
+  /** 兜底模式：sessionId -> 最近一次 list() 看到的日志 revision。 */
+  private readonly revisions = new Map<string, string>()
+  /** 当前回填进度（面板展示“统计中 x/y”）。 */
+  private progress: BackfillProgress = {
+    phase: 'idle', done: 0, total: 0, fromCache: 0, coldReads: 0, mode: 'projection',
+  }
+  /** 数据源模式：DSH 投影缓存 / 插件自持久化兜底。 */
+  private mode: 'projection' | 'fallback' = 'projection'
+  /** 最近一次汇总快照（dirty + TTL 节流）。 */
+  private cachedSnapshot: TokenUsageSnapshot | null = null
+  private dirty = true
+  private lastBuildAt = 0
+  private projection: ProjectionRegistryLike | null = null
+  private cache: ProjectionCacheLike | null = null
+  private coldQueue: PersistenceEntry[] = []
+  /** 兜底模式：会话载入时按需重读日志所需的持久化句柄。 */
+  private persistence: { open(id: string, access: 'read'): Promise<ReadHandleLike> } | null = null
+  /** 兜底模式：正在按需重读的会话（避免重复重读）。 */
+  private readonly refreshing = new Set<string>()
+  private started = false
+  private disposed = false
+  private persistTimer: ReturnType<typeof setTimeout> | null = null
+  private persistPending = false
+  private readonly disposers: Array<() => void> = []
+  private readonly storePath: string
 
   /**
    * @param ctx - Host context carrying session persistence.
    */
   constructor(ctx: Context) {
     super(ctx, 'tokenUsage')
+    this.storePath = fallbackStorePath()
   }
 
-  /** 挂载 live 订阅并启动历史回填（后台进行，不阻塞激活）。 */
+  /** 挂载 live 订阅并后台启动 bootstrap（不阻塞插件激活）。 */
   protected async [Service.init](): Promise<void> {
-    const sp = this.ctx.sessionPersistence
+    const sp = this.ctx.sessionPersistence as unknown as SessionPersistence | undefined
     const offLive = this.ctx.on('session/event', (session: Session, event: SessionEvent) => {
-      const sessionId = session.id
-      if (!sessionId || typeof event.seq !== 'number') return
-      if (this.backfillDone || this.foldedSeq.has(sessionId)) {
-        this.foldNew(sessionId, event)
-      } else {
-        const list = this.pending.get(sessionId) ?? []
-        list.push(event)
-        this.pending.set(sessionId, list)
-      }
+      this.onLiveEvent(session, event)
+    })
+    const offCreated = this.ctx.on('session/created', (session: Session) => {
+      this.onSessionCreated(session)
     })
     this.ctx.effect(() => () => {
+      this.disposed = true
+      this.started = false
       offLive()
-    }, 'dsh-token-usage: live subscription')
-    void this.runBackfill(sp)
-  }
-
-  /** 折叠一条 session 事件（usage / 消息时间线 / 工具与 skill 计数）。 */
-  private foldEvent(sessionId: string, event: SessionEvent): void {
-    const data = event.data
-    if (event.type === 'request/header') {
-      // 权威推理强度：只在变化时落盘，因此记住最近一次即为后续 step 的生效值。
-      const effort = (data as { header?: { config?: { reasoningEffort?: unknown } } } | undefined)
-        ?.header?.config?.reasoningEffort
-      if (typeof effort === 'string' && effort) this.currentEffort.set(sessionId, effort)
-    } else if (event.type === 'assistant/chunk') {
-      const chunk = data && (data as { chunk?: { type?: string; usage?: TokenUsageFields } }).chunk
-      if (chunk && chunk.type === 'usage' && chunk.usage) {
-        const key = stepKey(sessionId, (data as { turn: number }).turn, (data as { step: number }).step)
-        this.stepUsage.set(key, {
-          usage: chunk.usage, model: null, time: event.time, sessionId,
-          effort: this.currentEffort.get(sessionId),
-        })
-      }
-    } else if (event.type === 'assistant/message') {
-      const usage = data && (data as { usage?: TokenUsageFields }).usage
-      if (usage) {
-        const key = stepKey(sessionId, (data as { turn: number }).turn, (data as { step: number }).step)
-        const source = data && (data as { message?: { source?: { model?: string } } }).message?.source
-        const model = source && source.model ? String(source.model) : null
-        this.stepUsage.set(key, {
-          usage, model, time: event.time, sessionId,
-          effort: this.currentEffort.get(sessionId),
-        })
-      }
-      this.bumpMessage(sessionId, event.time)
-    } else if (event.type === 'user/message') {
-      this.bumpMessage(sessionId, event.time)
-    } else if (event.type === 'tool/call') {
-      const name = data && (data as { name?: string }).name
-      if (typeof name === 'string' && name) {
-        // Skill 使用统计：'skill' 工具调用，arguments 是 JSON 字符串 {"name": "..."}
-        if (name === 'skill') {
-          let skillName = 'skill'
-          try {
-            const args = JSON.parse(String((data as { arguments?: string }).arguments ?? '{}')) as { name?: string }
-            if (args && typeof args.name === 'string' && args.name) skillName = args.name
-          } catch {
-            // keep generic name
-          }
-          this.skillCounts.set(skillName, (this.skillCounts.get(skillName) ?? 0) + 1)
-        }
-        this.toolCounts.set(name, (this.toolCounts.get(name) ?? 0) + 1)
-      }
-    }
-  }
-
-  /** 延长会话消息时间线；>30min 间隔切分（Codex 风格）。 */
-  private bumpMessage(sessionId: string, time: number): void {
-    const meta = this.sessionMeta.get(sessionId) ?? { createdAt: 0, messageCount: 0, lastMsgTime: null, segStart: null, maxSeg: 0 }
-    meta.messageCount += 1
-    if (meta.createdAt === 0) meta.createdAt = time
-    if (meta.lastMsgTime == null) {
-      meta.lastMsgTime = time
-      meta.segStart = time
-    } else {
-      const gap = (time - meta.lastMsgTime) / 1000
-      if (gap > 1800) {
-        const segLen = (meta.lastMsgTime - meta.segStart!) / 1000
-        if (segLen > meta.maxSeg) meta.maxSeg = segLen
-        meta.segStart = time
-      }
-      meta.lastMsgTime = time
-    }
-    this.sessionMeta.set(sessionId, meta)
-  }
-
-  /** 只折叠比会话游标更新的事件。 */
-  private foldNew(sessionId: string, event: SessionEvent): void {
-    const maxSeq = this.foldedSeq.get(sessionId) ?? -1
-    if (event.seq <= maxSeq) return
-    this.foldedSeq.set(sessionId, event.seq)
-    this.foldEvent(sessionId, event)
-  }
-
-  /** 回填完成后，按序消化该 session 缓冲的 live 事件。 */
-  private drainPending(sessionId: string): void {
-    const buffered = this.pending.get(sessionId)
-    if (!buffered) return
-    this.pending.delete(sessionId)
-    for (const event of buffered) this.foldNew(sessionId, event)
-  }
-
-  /** 回填一个 session 的持久日志，然后消化其缓冲事件。 */
-  private async backfillSession(sp: SessionPersistence, sessionId: SessionId): Promise<void> {
-    let maxSeq = this.foldedSeq.get(sessionId) ?? -1
-    // SessionPersistence.open(id, 'read') + handle.read() replaced the legacy
-    // inspect(); the header carries the creation time the fold needs.
-    const handle = await sp.open(sessionId, 'read')
-    try {
-      const { createdAt } = handle.header
-      if (createdAt) {
-        const existing = this.sessionMeta.get(sessionId)
-        if (existing) existing.createdAt = createdAt
-        else this.sessionMeta.set(sessionId, { createdAt, messageCount: 0, lastMsgTime: null, segStart: null, maxSeg: 0 })
-      }
-      const { events } = await handle.read(0)
-      // DSH 的初始 request/header 可能不带 reasoningEffort（由 adapter 默认值决定）。
-      // 用该 session 首个明确档位为最早的几步兜底，避免退化成靠 token 猜测的"关闭"。
-      for (const ev of events) {
-        if (ev.type !== 'request/header') continue
-        const e = (ev.data as { header?: { config?: { reasoningEffort?: unknown } } })
-          ?.header?.config?.reasoningEffort
-        if (typeof e === 'string' && e) {
-          this.currentEffort.set(sessionId, e)
-          break
+      offCreated()
+      for (const dispose of this.disposers) {
+        try {
+          dispose()
+        } catch {
+          // ignore
         }
       }
-      for (const event of events) {
-        if (event.seq <= maxSeq) continue
-        maxSeq = event.seq
-        this.foldEvent(sessionId, event)
-      }
-    } finally {
-      await handle.close()
-    }
-    this.foldedSeq.set(sessionId, maxSeq)
-    this.drainPending(sessionId)
+      this.disposers.length = 0
+      if (this.persistTimer !== null) clearTimeout(this.persistTimer)
+      this.persistTimer = null
+    }, 'dsh-token-usage: lifecycle')
+    void this.bootstrap(sp)
   }
 
-  /** 启动历史回填；持久化服务缺失时退化为仅实时累计。 */
-  private async runBackfill(sp: SessionPersistence | undefined): Promise<void> {
-    if (!sp || typeof sp.list !== 'function' || typeof sp.open !== 'function') {
-      console.warn('[token-usage] sessionPersistence unavailable — live accumulation only')
-      this.backfillDone = true
+  /** 决定数据源模式并启动回填。 */
+  private async bootstrap(sp: SessionPersistence | undefined): Promise<void> {
+    this.started = true
+    if (!sp || typeof (sp as unknown as { list?: unknown }).list !== 'function') {
+      warn('sessionPersistence unavailable — statistics stay empty')
+      this.progress.phase = 'ready'
+      this.dirty = true
       return
     }
+    this.progress.phase = 'scanning'
+    this.dirty = true
+    this.persistence = sp as unknown as { open(id: string, access: 'read'): Promise<ReadHandleLike> }
     try {
-      const snapshots = await sp.list()
-      for (const snapshot of snapshots) {
-        const sessionId = snapshot?.header?.id
-        if (!sessionId) continue
-        try {
-          await this.backfillSession(sp, sessionId)
-        } catch (error) {
-          console.warn(`[token-usage] backfill failed for ${sessionId}: ${error instanceof Error ? error.message : String(error)}`)
-        }
+      const ready = await this.waitForProjectionServices()
+      if (this.disposed) return
+      if (ready) {
+        this.mode = 'projection'
+        this.progress.mode = 'projection'
+        await this.bootstrapProjection(sp as unknown as { list(): Promise<PersistenceEntry[]>, open(id: string, access: 'read'): Promise<ReadHandleLike> })
+      } else {
+        this.mode = 'fallback'
+        this.progress.mode = 'fallback'
+        await this.bootstrapFallback(sp as unknown as { list(): Promise<PersistenceEntry[]>, open(id: string, access: 'read'): Promise<ReadHandleLike> })
       }
     } catch (error) {
-      console.warn(`[token-usage] session list failed: ${error instanceof Error ? error.message : String(error)}`)
+      warn(`bootstrap failed: ${error instanceof Error ? error.message : String(error)}`)
+      this.progress.phase = 'ready'
+      this.dirty = true
     }
-    for (const sessionId of [...this.pending.keys()]) {
-      this.foldedSeq.set(sessionId, -1)
-      this.drainPending(sessionId)
-    }
-    this.backfillDone = true
   }
 
-  /** 各会话最长聊天段的最大值（>30min 间隔切分）。 */
-  private longestChatSegment(): number {
-    let maxSeg = 0
-    for (const meta of this.sessionMeta.values()) {
-      let seg = meta.maxSeg
-      if (meta.lastMsgTime != null && meta.segStart != null) {
-        const tail = (meta.lastMsgTime - meta.segStart) / 1000
-        if (tail > seg) seg = tail
+  /**
+   * 等待 DSH 的投影服务与投影缓存服务就绪；就绪时注册单元并订阅变更。
+   * 超时/服务缺失返回 false（走兜底模式）。
+   */
+  private waitForProjectionServices(): Promise<boolean> {
+    return new Promise<boolean>(resolve => {
+      let settled = false
+      let fiber: { dispose?: () => void } | null = null
+      const finish = (ready: boolean): void => {
+        if (settled) return
+        settled = true
+        clearTimeout(timer)
+        if (!ready) {
+          try {
+            fiber?.dispose?.()
+          } catch {
+            // ignore
+          }
+        }
+        resolve(ready)
       }
-      if (seg > maxSeg) maxSeg = seg
-    }
-    return maxSeg
+      const timer = setTimeout(() => finish(false), SERVICE_WAIT_MS)
+      try {
+        fiber = this.ctx.inject(['sessionProjections', 'sessionProjectionCache'], (injected: Context) => {
+          if (settled || this.disposed) return
+          const projection = injected.get('sessionProjections') as unknown as ProjectionRegistryLike | undefined
+          const cache = injected.get('sessionProjectionCache') as unknown as ProjectionCacheLike | undefined
+          if (!projection || typeof projection.register !== 'function' || !cache || typeof cache.cachedSnapshot !== 'function') {
+            finish(false)
+            return
+          }
+          try {
+            this.registerUnit(projection)
+            if (typeof projection.onChanged === 'function') {
+              const dispose = projection.onChanged((session, key, value) => {
+                if (key !== UNIT_KEY) return
+                this.onProjectionChanged(session, value)
+              })
+              if (typeof dispose === 'function') this.disposers.push(dispose)
+            }
+            this.projection = projection
+            this.cache = cache
+            finish(true)
+          } catch (error) {
+            warn(`projection registration failed: ${error instanceof Error ? error.message : String(error)}`)
+            finish(false)
+          }
+        })
+      } catch (error) {
+        warn(`projection services unavailable: ${error instanceof Error ? error.message : String(error)}`)
+        finish(false)
+      }
+    })
   }
 
-  /** 构建 JSON 可序列化的聚合快照。 */
-  private snapshot(): TokenUsageSnapshot {
-    const totals = zeroCounts()
-    const dailyTokens = new Map<string, number>()
-    const thinkingLevels: ThinkingLevelCounts = { high: 0, medium: 0, low: 0, off: 0 }
-    const modelCounts = new Map<string, number>()
-    const sessionTotals = new Map<string, number>()
+  /** 注册 `dtsUsage` 投影单元（有界状态 + wire view）。 */
+  private registerUnit(projection: ProjectionRegistryLike): void {
+    projection.register({
+      key: UNIT_KEY,
+      stateVersion: UNIT_VERSION,
+      stateSchema: unitStateSchema,
+      init: (header: { createdAt?: number } | undefined) => createSessionState(header),
+      apply: (state: SessionUnitState, event: SessionEvent) => applySessionEvent(state, event),
+      wire: {
+        viewSchema: unitViewSchema,
+        view: (state: SessionUnitState) => sessionView(state),
+      },
+    })
+  }
 
-    for (const record of this.stepUsage.values()) {
-      const usage = record.usage
-      const total = (usage.inputTokens ?? 0) + (usage.outputTokens ?? 0)
-        + (usage.cacheReadTokens ?? 0) + (usage.cacheWriteTokens ?? 0)
-      for (const field of USAGE_FIELDS) totals[field] += usage[field] ?? 0
+  /** live 会话的投影视图变化：直接替换该会话贡献（不累加，避免双算）。 */
+  private onProjectionChanged(session: Session, value: unknown): void {
+    const id = session?.id
+    if (!id || this.mode !== 'projection') return
+    if (!value || typeof value !== 'object') return
+    this.views.set(id, value as SessionView)
+    this.dirty = true
+  }
 
-      const day = dayKey(record.time)
-      dailyTokens.set(day, (dailyTokens.get(day) ?? 0) + total)
+  /** B 方案：缓存行优先，未命中才冷读原始日志。 */
+  private async bootstrapProjection(sp: { list(): Promise<PersistenceEntry[]>, open(id: string, access: 'read'): Promise<ReadHandleLike> }): Promise<void> {
+    const snapshots = await sp.list()
+    const list = Array.isArray(snapshots) ? snapshots : []
+    this.progress.total = list.length
 
-      // 优先用 DSH 权威档位；仅在没有 request/header 记录的旧日志上回退 token 近似。
-      const level = effortBucket(record.effort) ?? thinkingLevel(usage.reasoningTokens)
-      thinkingLevels[level] += 1
-
-      const model = record.model ?? 'unknown'
-      const fam = modelFamily(model)
-      modelCounts.set(fam, (modelCounts.get(fam) ?? 0) + 1)
-
-      sessionTotals.set(record.sessionId, (sessionTotals.get(record.sessionId) ?? 0) + total)
-    }
-
-    const peakTokens = sessionTotals.size ? Math.max(...sessionTotals.values()) : 0
-
-    const sessionDates: string[] = []
-    const sessionIdSet = new Set<string>()
-    for (const [id, meta] of this.sessionMeta) {
-      sessionIdSet.add(id)
-      const date = meta.createdAt ? new Date(meta.createdAt) : null
-      if (date && !Number.isNaN(date.getTime())) {
-        sessionDates.push(dayKey(date.getTime()))
+    // 1) 本进程内已经 live 的会话：读实时投影（可能比缓存行新）。
+    const store = this.ctx.get('sessions') as unknown as SessionStoreLike | undefined
+    if (store && typeof store.list === 'function') {
+      for (const session of store.list()) {
+        try {
+          const block = this.projection?.snapshot?.(session, [UNIT_KEY])
+          const value = block?.values?.[UNIT_KEY]
+          if (value) this.views.set(session.id, value as SessionView)
+        } catch (error) {
+          warn(`live snapshot failed for ${session.id}: ${error instanceof Error ? error.message : String(error)}`)
+        }
       }
     }
-    const [currentStreak, longestStreak] = streakDays(sessionDates)
-    const maxDurationSec = this.longestChatSegment()
 
-    const totalToolCalls = [...this.toolCounts.values()].reduce((a, b) => a + b, 0)
-    const distinctTools = this.toolCounts.size
+    // 2) 逐个会话读投影缓存行（零日志 I/O）；未命中进入冷读队列。
+    for (const entry of list) {
+      const id = entry?.header?.id
+      if (!id) continue
+      this.listed.add(id)
+      if (this.views.has(id)) continue
+      let block: ProjectionBlock | undefined
+      try {
+        block = this.cache?.cachedSnapshot(entry.header, [UNIT_KEY])
+      } catch (error) {
+        warn(`cached projection read failed for ${id}: ${error instanceof Error ? error.message : String(error)}`)
+        block = undefined
+      }
+      const value = block?.values?.[UNIT_KEY]
+      if (value) {
+        this.views.set(id, value as SessionView)
+        this.progress.fromCache += 1
+      } else {
+        this.coldQueue.push(entry)
+      }
+    }
 
-    const topPlugins = [...this.toolCounts.entries()]
-      .filter(([name]) => !CORE_TOOLS.has(name))
-      .sort((a, b) => b[1] - a[1])
-      .slice(0, 5)
+    this.progress.done = Math.max(0, list.length - this.coldQueue.length)
+    this.dirty = true
+    if (this.coldQueue.length > 0) {
+      this.progress.phase = 'backfilling'
+      await this.drainColdQueue(sp, true)
+    }
+    this.progress.phase = 'ready'
+    this.dirty = true
+  }
 
-    const topSkills = [...this.skillCounts.entries()].sort((a, b) => b[1] - a[1]).slice(0, 5)
-    const totalSkillUses = [...this.skillCounts.values()].reduce((a, b) => a + b, 0)
-    const distinctSkills = this.skillCounts.size
+  /** 冷读队列：并发度受控、每批之后让出事件循环、按会话创建时间从新到旧。 */
+  private async drainColdQueue(
+    sp: { open(id: string, access: 'read'): Promise<ReadHandleLike> },
+    projectionMode: boolean,
+  ): Promise<void> {
+    const queue = this.coldQueue
+    this.coldQueue = []
+    queue.sort((left, right) => num(right?.header?.createdAt) - num(left?.header?.createdAt))
+    let cursor = 0
+    const worker = async (): Promise<void> => {
+      for (;;) {
+        if (this.disposed) return
+        const entry = queue[cursor]
+        cursor += 1
+        if (!entry || !entry.header?.id) return
+        const startedAt = performance.now()
+        try {
+          await this.coldReadSession(sp, entry, projectionMode)
+        } catch (error) {
+          warn(`cold read failed for ${entry.header.id}: ${error instanceof Error ? error.message : String(error)}`)
+        }
+        this.progress.done += 1
+        this.dirty = true
+        if (performance.now() - startedAt > 40) await yieldToEventLoop()
+      }
+    }
+    const workers: Array<Promise<void>> = []
+    for (let i = 0; i < COLD_READ_CONCURRENCY; i++) workers.push(worker())
+    await Promise.all(workers)
+  }
 
-    const sortedDates = sessionDates.sort()
-    const earliestDate = sortedDates[0] ?? ''
-    const latestDate = sortedDates[sortedDates.length - 1] ?? ''
+  /** 冷读一个会话：优先让 DSH 投影缓存折叠并写回，缺失时本地折叠兜底。 */
+  private async coldReadSession(
+    sp: { open(id: string, access: 'read'): Promise<ReadHandleLike> },
+    entry: PersistenceEntry,
+    projectionMode: boolean,
+  ): Promise<void> {
+    const id = entry.header?.id
+    if (!id) return
+    const handle = await sp.open(id, 'read')
+    try {
+      const result = await handle.read(0)
+      const events = Array.isArray(result?.events) ? result.events : []
+      const header = (handle.header ?? entry.header) as { createdAt?: number } | undefined
+      const inherited = typeof handle.inheritedEventCount === 'number' ? handle.inheritedEventCount : 0
+      let value: unknown
+      if (projectionMode && this.cache) {
+        try {
+          const cut = this.cache.coldSnapshot(header, inherited, events)
+          value = cut?.values?.[UNIT_KEY]
+        } catch (error) {
+          warn(`cold projection failed for ${id}: ${error instanceof Error ? error.message : String(error)}`)
+        }
+      }
+      if (value && typeof value === 'object') {
+        this.views.set(id, value as SessionView)
+        this.progress.coldReads += 1
+        return
+      }
+      // 兜底：本地折叠（写回失败/非投影模式时也保证数字正确）。
+      let state = createSessionState(header)
+      for (const event of events) state = applySessionEvent(state, event)
+      this.views.set(id, sessionView(state))
+      this.states.set(id, state)
+      this.foldedSeq.set(id, events.length > 0 ? num(events[events.length - 1]?.seq) : -1)
+      this.progress.coldReads += 1
+      this.drainFallbackPending(id)
+    } finally {
+      try {
+        await handle.close()
+      } catch {
+        // ignore
+      }
+    }
+  }
 
-    return {
-      totalConversations: sessionIdSet.size,
-      totalMessages: [...this.sessionMeta.values()].reduce((a, m) => a + m.messageCount, 0),
-      totalTokens: totals.inputTokens + totals.outputTokens + totals.cacheReadTokens + totals.cacheWriteTokens,
-      peakTokens,
-      maxDurationSec,
-      maxDurationText: fmtDuration(maxDurationSec),
-      currentStreak,
-      longestStreak,
-      dailyTokens: Object.fromEntries(dailyTokens),
-      thinkingLevels,
-      totalToolCalls,
-      distinctTools,
-      topPlugins,
-      topSkills,
-      totalSkillUses,
-      distinctSkills,
-      modelBreakdown: Object.fromEntries(modelCounts),
-      earliestDate,
-      latestDate,
-      updatedAt: Date.now(),
+  /** A 方案兜底：用自己的持久化 rollup + 日志 revision 做增量。 */
+  private async bootstrapFallback(sp: { list(): Promise<PersistenceEntry[]>, open(id: string, access: 'read'): Promise<ReadHandleLike> }): Promise<void> {
+    const store = await this.loadFallbackStore()
+    const snapshots = await sp.list()
+    const list = Array.isArray(snapshots) ? snapshots : []
+    this.progress.total = list.length
+    for (const entry of list) {
+      const id = entry?.header?.id
+      if (!id) continue
+      this.listed.add(id)
+      if (typeof entry.revision === 'string' && entry.revision) this.revisions.set(id, entry.revision)
+      const record = store?.sessions?.[id]
+      if (record && record.view && sameRevision(record.revision, entry.revision)) {
+        this.views.set(id, record.view)
+        this.progress.fromCache += 1
+      } else {
+        this.coldQueue.push(entry)
+      }
+    }
+    this.progress.done = Math.max(0, list.length - this.coldQueue.length)
+    this.dirty = true
+    if (this.coldQueue.length > 0) {
+      this.progress.phase = 'backfilling'
+      await this.drainColdQueue(sp, false)
+    }
+    this.progress.phase = 'ready'
+    this.dirty = true
+    this.schedulePersist()
+  }
+
+  /** live 事件：投影模式由 onChanged 驱动，这里只服务兜底模式。 */
+  private onLiveEvent(session: Session, event: SessionEvent): void {
+    if (this.mode !== 'fallback' || this.disposed) return
+    const id = session?.id
+    if (!id || typeof event?.seq !== 'number') return
+    if (this.states.has(id)) {
+      this.foldFallbackEvent(id, event)
+      return
+    }
+    if (this.listed.has(id)) {
+      const buffered = this.pending.get(id) ?? []
+      buffered.push(event)
+      this.pending.set(id, buffered)
+      // 会话在启动后第一次载入：按需重读一次日志拿到完整折叠状态，再消化缓冲事件。
+      this.ensureFallbackState(id, session.header)
+      return
+    }
+    // 启动后新建的会话：从空状态开始折叠。
+    this.states.set(id, createSessionState(session.header))
+    this.foldedSeq.set(id, -1)
+    this.foldFallbackEvent(id, event)
+  }
+
+  /** 会话载入（attach）时同步该会话的视图：投影模式读实时 cell，兜底模式按需重读。 */
+  private onSessionCreated(session: Session): void {
+    const id = session?.id
+    if (!id || this.disposed) return
+    if (this.mode === 'projection' && this.projection) {
+      try {
+        const block = this.projection.cachedSnapshot?.(session, [UNIT_KEY])
+        const value = block?.values?.[UNIT_KEY]
+        if (value && typeof value === 'object') {
+          this.views.set(id, value as SessionView)
+          this.dirty = true
+        }
+      } catch (error) {
+        warn(`live projection read failed for ${id}: ${error instanceof Error ? error.message : String(error)}`)
+      }
+      return
+    }
+    if (this.mode === 'fallback' && !this.states.has(id) && this.listed.has(id)) {
+      // 兜底模式下，缓存复用的会话在真正载入时重读日志，拿到可继续折叠的完整状态。
+      this.ensureFallbackState(id, session.header)
+    }
+  }
+
+  /** 兜底模式：按需重读一个会话的完整日志（用于会话载入后继续增量折叠）。 */
+  private ensureFallbackState(id: string, header?: { createdAt?: number }): void {
+    if (this.refreshing.has(id) || this.persistence === null || this.disposed) return
+    this.refreshing.add(id)
+    void (async () => {
+      try {
+        await this.reloadFallbackSession(id, header)
+      } catch (error) {
+        warn(`fallback reload failed for ${id}: ${error instanceof Error ? error.message : String(error)}`)
+      } finally {
+        this.refreshing.delete(id)
+      }
+    })()
+  }
+
+  /** 兜底模式：重读一个会话日志并从零折叠（不重复计入进度）。 */
+  private async reloadFallbackSession(id: string, header?: { createdAt?: number }): Promise<void> {
+    const persistence = this.persistence
+    if (persistence === null) return
+    const handle = await persistence.open(id, 'read')
+    try {
+      const result = await handle.read(0)
+      const events = Array.isArray(result?.events) ? result.events : []
+      const resolvedHeader = (handle.header ?? header) as { createdAt?: number } | undefined
+      let state = createSessionState(resolvedHeader)
+      for (const event of events) state = applySessionEvent(state, event)
+      this.states.set(id, state)
+      this.foldedSeq.set(id, events.length > 0 ? num(events[events.length - 1]?.seq) : -1)
+      this.views.set(id, sessionView(state))
+      this.dirty = true
+      this.schedulePersist()
+      this.drainFallbackPending(id)
+    } finally {
+      try {
+        await handle.close()
+      } catch {
+        // ignore
+      }
+    }
+  }
+
+  /** 兜底模式：按 seq 水位折叠一条 live 事件。 */
+  private foldFallbackEvent(id: string, event: SessionEvent): void {
+    const maxSeq = this.foldedSeq.get(id) ?? -1
+    if (event.seq <= maxSeq) return
+    const state = this.states.get(id) ?? createSessionState()
+    const next = applySessionEvent(state, event)
+    this.states.set(id, next)
+    this.foldedSeq.set(id, event.seq)
+    this.views.set(id, sessionView(next))
+    this.dirty = true
+    this.schedulePersist()
+  }
+
+  /** 冷读完成后消化该会话缓冲的 live 事件。 */
+  private drainFallbackPending(id: string): void {
+    const buffered = this.pending.get(id)
+    if (!buffered) return
+    this.pending.delete(id)
+    for (const event of buffered) this.foldFallbackEvent(id, event)
+  }
+
+  /** 兜底模式持久化：读取本地 rollup（损坏/缺失时返回 undefined）。 */
+  private async loadFallbackStore(): Promise<FallbackStore | undefined> {
+    try {
+      const raw = await readFile(this.storePath, 'utf8')
+      const parsed = JSON.parse(raw) as Partial<FallbackStore> | null
+      if (!parsed || typeof parsed !== 'object') return undefined
+      if (parsed.version !== FALLBACK_STORE_VERSION) return undefined
+      const sessions = parsed.sessions
+      if (!sessions || typeof sessions !== 'object') return undefined
+      return { version: FALLBACK_STORE_VERSION, sessions: sessions as Record<string, FallbackRecord> }
+    } catch {
+      return undefined
+    }
+  }
+
+  /** 兜底模式持久化：防抖写入（原子替换）。 */
+  private schedulePersist(): void {
+    if (this.mode !== 'fallback' || this.disposed) return
+    this.persistPending = true
+    if (this.persistTimer !== null) return
+    this.persistTimer = setTimeout(() => {
+      this.persistTimer = null
+      void this.flushFallbackStore()
+    }, FALLBACK_FLUSH_DELAY_MS)
+    const timer = this.persistTimer as unknown as { unref?: () => void }
+    if (typeof timer.unref === 'function') timer.unref()
+  }
+
+  /** 把当前 rollup 写回本地文件（失败不影响统计）。 */
+  private async flushFallbackStore(): Promise<void> {
+    if (!this.persistPending || this.mode !== 'fallback' || this.disposed) return
+    this.persistPending = false
+    const sessions: Record<string, FallbackRecord> = {}
+    for (const [id, view] of this.views) {
+      sessions[id] = { revision: this.revisions.get(id) ?? '', view }
+    }
+    const payload: FallbackStore = { version: FALLBACK_STORE_VERSION, sessions }
+    try {
+      await mkdir(dirname(this.storePath), { recursive: true })
+      const tempPath = `${this.storePath}.tmp`
+      await writeFile(tempPath, JSON.stringify(payload), 'utf8')
+      await rename(tempPath, this.storePath)
+    } catch (error) {
+      warn(`fallback store write failed: ${error instanceof Error ? error.message : String(error)}`)
     }
   }
 
@@ -504,7 +706,17 @@ export class TokenUsageService extends TypertRemoteService {
    */
   @Remote('getStats')
   getStats(): TokenUsageSnapshot {
-    return this.snapshot()
+    const now = Date.now()
+    if (this.cachedSnapshot === null || this.dirty || now - this.lastBuildAt >= SNAPSHOT_TTL_MS) {
+      const progress: BackfillProgress = {
+        ...this.progress,
+        done: Math.min(this.progress.done, this.progress.total || this.progress.done),
+      }
+      this.cachedSnapshot = buildGlobalSnapshot(this.views.values(), progress)
+      this.dirty = false
+      this.lastBuildAt = now
+    }
+    return this.cachedSnapshot
   }
 }
 

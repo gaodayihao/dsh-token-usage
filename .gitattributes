@@ -1,0 +1,6 @@
+# 保证构建产物与生成脚本在任意机器上都按 LF 检出，
+# 这样 `node scripts/build-lib.mjs --check` 不会因为 CRLF 转换误报。
+* text=auto
+lib/** text eol=lf
+scripts/** text eol=lf
+src/** text eol=lf

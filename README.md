@@ -24,7 +24,9 @@ DSH 刚发布，大家最关心的就是：**我的 Token 到底花哪去了？*
 - **活动洞察（含最常用模型）+ 插件 / Skill Top5**：谁在消耗最多，一目了然
 - **两个原生入口**，与 DSH UI 融为一体：
   - 侧边栏底部「Token 统计」按钮（应用级常驻）
-  - 会话头部实时用量胶囊：`⚡ 2.61亿`（每 5 秒自动刷新）
+  - 会话头部实时用量胶囊：`⚡ 2.61亿`（面板打开时 5 秒刷新，关闭时低频刷新）
+- **增量统计，冷启动零日志解压**：会话聚合持久化在 DSH 的投影缓存里，启动只读
+  每个会话的缓存行；只有没缓存的会话才冷读一次原始日志，之后永久命中
 - **深空紫双主题**，跟随系统 / 手动切换
 
 ![入口位置：侧边栏底部按钮 + 会话头部 ⚡ 胶囊](./docs/screenshot-entries.png)
@@ -150,44 +152,74 @@ node -e "import('file:///C:/Users/<你>/.dsh/profiles/web/node_modules/dsh-token
 3. 点击任一入口打开面板；右上角可切主题、关闭
 4. 热力图支持三视图切换 + 悬浮看单日 / 单周 / 累计数值
 
-数据每 5 秒刷新；历史会话自动回填，重启不丢。
+面板打开时每 5 秒刷新一次，关闭后降频到 60 秒（胶囊仍有数据）；面板打开瞬间立即刷新。
+
+历史会话首次安装需要一次后台回填：热力图标题旁会显示「统计中 312/907」，
+数字逐步长满后徽标自动消失；回填按会话从新到旧进行、限并发、不阻塞 DSH 主流程。
+回填完成后的重启不再解析任何历史日志（每个会话聚合已持久化在
+`~/.dsh/storages/session_projcache/` 的投影缓存里）。
 
 ## 数据口径
 
 与 DSH 内置 token-meter 一致：
 
-- 每 step 一条 usage 记录：`assistant/chunk {type:'usage'}` 为持久记录；`assistant/message.usage` 覆盖同一步的 chunk 记录（不重复计数）
+- 每 step 一条 usage 结算：`assistant/message.usage` 是权威记录；`assistant/attempt`
+  取 stream 内最后一个 usage 样本（重试尝试的真实消耗）；`llm/retry-started` 复位
+  去重槽，同一步的重复结算按“替换”记账（差值计入总量），不重复计数
+- 兼容旧 v3 日志的 `assistant/chunk {type:'usage'}`（v4 日志里不再出现）
 - 累计 Token = input + output + cacheRead + cacheWrite
-- thinking 等级由 `reasoningTokens` 近似；Skill 统计从 `skill` 工具调用参数解析
+- thinking 等级优先取 `request/header` 的 `reasoningEffort`（DSH 实际下发档位），
+  没有该事件的旧日志才回退 `reasoningTokens` 近似；Skill 统计从 `skill` 工具调用参数解析
 
 ## 架构
 
 ```
-┌─ Host（DSH 进程内）──────────────────────────────┐
-│ TokenUsageService (TypertRemoteService)          │
-│  ├─ 启动时回填全部历史 session                    │
-│  ├─ session/event 实时折叠                        │
-│  └─ @Remote('getStats') → /api/tokenUsage/getStats│
-└──────────────┬───────────────────────────────────┘
+┌─ Host（DSH 进程内）────────────────────────────────────────────────┐
+│ TokenUsageService (TypertRemoteService)                            │
+│  ├─ dtsUsage 投影单元（有界会话聚合，sessionProjections 增量驱动）   │
+│  ├─ 冷启动：逐个 sessionProjectionCache.cachedSnapshot()（零 I/O）  │
+│  ├─ 未命中：coldSnapshot() 冷读一次并写回 checkpoint                │
+│  ├─ live：sessionProjections.onChanged 增量更新内存 rollup          │
+│  ├─ 无投影服务时：自持久化 rollup + 日志 revision 增量（兜底）        │
+│  └─ @Remote('getStats') → /api/tokenUsage/getStats                  │
+└──────────────┬─────────────────────────────────────────────────────┘
                │ connection.rpc（通用通道，无需改 DSH）
-┌─ Browser ────▼───────────────────────────────────┐
-│  ├─ sidebar.footer.action        侧栏入口        │
-│  ├─ conversation.session.header.actions ⚡ 胶囊   │
-│  └─ shell.overlay                面板模态框       │
-└──────────────────────────────────────────────────┘
+┌─ Browser ────▼─────────────────────────────────────────────────────┐
+│  ├─ sidebar.footer.action        侧栏入口                          │
+│  ├─ conversation.session.header.actions ⚡ 胶囊                     │
+│  └─ shell.overlay                面板模态框                         │
+└────────────────────────────────────────────────────────────────────┘
 ```
 
 | 文件 | 作用 |
 |---|---|
-| `src/index.ts` | Host 半边：聚合逻辑 + Typert Remote |
-| `src/client/index.ts` | 浏览器半边：面板 UI + 两个入口 + 5s 轮询 |
-| `src/types.ts` | 跨平面 wire 类型 |
+| `src/index.ts` | Host 半边：投影单元注册 / 缓存读取 / 冷读回填 / 兜底持久化 + Typert Remote |
+| `src/aggregate.ts` | 纯聚合模块（不依赖 DSH 运行时）：`createSessionState` / `applySessionEvent` / `sessionView` / `buildGlobalSnapshot` |
+| `src/client/index.ts` | 浏览器半边：面板 UI + 两个入口 + 进度徽标 + 自适应轮询 |
+| `src/types.ts` | 跨平面 wire 类型（含 `backfill` 进度） |
+| `scripts/build-lib.mjs` | 从 `src/` 生成 `lib/`（Node 24 类型擦除，无需 DSH 工具链） |
+| `scripts/verify/` | 独立参考实现 + 全量日志对拍 + 加载冒烟 |
 | `cordis.patch.yml` | bundle patch：插入插件行 |
 | `lib/` | 已提交的构建产物（装了就能跑，无需构建） |
 
 ## 开发
 
-`lib/` 里是现成构建产物，**一般使用者无需构建**。要改代码的话，构建链路依赖 DSH 仓库的编译工具（tsc + tsdown + Typert 生成器），把 `src/` 放进 DSH 仓库的 `packages/extensions/dsh-token-usage/` 下构建，构建产物 `lib/` 同步回本仓库提交即可。
+`lib/` 里是现成构建产物，**一般使用者无需构建**。要改代码的话，本仓库自带构建脚本：
+
+```sh
+node scripts/build-lib.mjs          # 重新生成 lib/types/*.js 与 lib/client.js
+node scripts/build-lib.mjs --check  # 只校验 lib/ 是否与 src/ 同步
+```
+
+它用 Node 24 内置的 `module.stripTypeScriptTypes` 做“只擦除类型”的等价编译，
+不需要 DSH 仓库的 tsc/tsdown 工具链。注意两个生成物需要人工同步：
+
+- `lib/typert.host.js` / `lib/typert.remote-client.js` 是 Typert 生成器的产物，
+  修改 `TokenUsageSnapshot` 等 wire 类型时要同步它们的 strict result schema
+  （构建脚本会检查 `backfill` 字段是否存在）；
+- `.d.ts` 声明文件随源码手工维护。
+
+改完记得跑一次 `scripts/verify/` 里的对拍（见脚本头部注释）。
 
 ### 发布（给维护者）
 
@@ -198,10 +230,10 @@ GitHub 直装取的是**已提交的文件**，所以每次对外发布都要：
 3. 打 tag 并推送，让使用者可以锁版本：
 
    ```sh
-   git tag v0.2.0 && git push origin main --tags
+   git tag v0.3.0 && git push origin main --tags
    ```
 
-4. 发布后在干净环境验证一次：`dsh plugin --profile web add "github:gaodayihao/dsh-token-usage#v0.2.0"`。
+4. 发布后在干净环境验证一次：`dsh plugin --profile web add "github:gaodayihao/dsh-token-usage#v0.3.0"`。
 
 ## License
 

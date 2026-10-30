@@ -21,6 +21,25 @@ export interface ThinkingLevelCounts {
   off: number
 }
 
+/** 回填阶段。 */
+export type BackfillPhase = 'idle' | 'scanning' | 'backfilling' | 'ready' | 'fallback'
+
+/** 历史数据回填进度（首次安装/缓存未命中时逐步填充）。 */
+export interface BackfillProgress {
+  /** 当前阶段：扫描会话列表 / 冷读回填 / 就绪 / 兜底模式（无投影缓存服务）。 */
+  phase: BackfillPhase
+  /** 已完成的会话数（命中缓存 + 冷读完成）。 */
+  done: number
+  /** 需要覆盖的会话总数。 */
+  total: number
+  /** 直接命中投影缓存、零日志 I/O 的会话数。 */
+  fromCache: number
+  /** 本次进程内从原始日志冷读的会话数。 */
+  coldReads: number
+  /** 数据来源：DSH 投影缓存，或插件自持久化兜底。 */
+  mode: 'projection' | 'fallback'
+}
+
 /** getStats 快照：一次调用返回的全量聚合（Codex 个人用量页口径）。 */
 export interface TokenUsageSnapshot {
   /** 有历史记录的会话总数。 */
@@ -63,4 +82,6 @@ export interface TokenUsageSnapshot {
   latestDate: string
   /** 快照生成时间（epoch ms）。 */
   updatedAt: number
+  /** 历史回填进度（面板据此显示"统计中 x/y"）。 */
+  backfill: BackfillProgress
 }
