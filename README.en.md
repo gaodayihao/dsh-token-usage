@@ -28,6 +28,8 @@ This plugin adds a token-usage stats panel to the DSH web UI, aggregating token 
 - **Incremental statistics, zero log decompression on warm start**: per-session aggregates are
   persisted in DSH's projection cache, so a restart only reads one cache row per session;
   only uncached sessions pay a one-time cold read
+- **Recover lost history**: import a historical baseline (from screenshots / external records)
+  so a gap caused by deleted logs or a disk failure still shows up — labelled and reversible
 - **Deep-space purple dual theme**, follows the system / manual toggle
 
 ![Where the entries are: sidebar button + session-header ⚡ capsule](./docs/screenshot-entries.png)
@@ -224,6 +226,50 @@ Consistent with DSH's built-in token-meter:
   falls back to a `reasoningTokens` approximation only for old logs without that event; skill
   stats are parsed from `skill` tool call arguments
 
+## Recovering lost history (historical baseline import)
+
+If a period of session logs is gone (deleted, disk failure, machine switch) and you still want its
+token usage reflected, drop a **historical baseline file** into the DSH data directory:
+
+```
+~/.dsh/storages/dsh-token-usage/history-baseline.v1.json
+```
+
+The plugin loads it at startup (and within 5s of the file's mtime changing) and merges it with the
+aggregates computed from real sessions:
+
+- totals / conversations / messages / tool calls / peak / longest duration: added or maxed;
+- daily tokens: summed per date, so the heatmap fills that period;
+- streak: recomputed over the union of baseline active dates and real session dates;
+- thinking / model breakdown: real-session distribution is kept unless the baseline provides counts.
+
+Example:
+
+```json
+{
+  "version": 1,
+  "label": "2026-08-26 ~ 2026-10-10 (before the disk failure, imported from a screenshot)",
+  "range": ["2026-08-26", "2026-10-10"],
+  "totalTokens": 42135000000,
+  "peakTokens": 2309000000,
+  "maxDurationSec": 35820,
+  "totalConversations": 1137,
+  "totalMessages": 153724,
+  "totalToolCalls": 194617,
+  "distinctTools": 228,
+  "topPlugins": [["pwsh", 49556], ["mcp__vs-mcp-ursa__FindSymbols", 5101]],
+  "dailyTokens": { "2026-08-26": 310000000, "2026-09-23": 2789000000 },
+  "dailyEstimated": true,
+  "activeDates": ["2026-08-31", "2026-09-01"]
+}
+```
+
+- The panel labels it: `含导入历史 <from> → <to>` (with `估算` when `dailyEstimated` is true);
+- **Deleting the file rolls everything back** (no restart needed, effective within 5s);
+- Baseline periods must not overlap real data, otherwise counts double;
+- `scripts/history/build-baseline.mjs` is the example generator used to recover the
+  2026-08-26 → 2026-10-10 period from a screenshot.
+
 ## Architecture
 
 ```
@@ -249,7 +295,9 @@ Consistent with DSH's built-in token-meter:
 | `src/index.ts` | Host half: projection unit / cache reads / cold backfill / fallback persistence + Typert Remote |
 | `src/aggregate.ts` | Pure aggregation (no DSH runtime): `createSessionState` / `applySessionEvent` / `sessionView` / `buildGlobalSnapshot` |
 | `src/client/index.ts` | Browser half: panel UI + two entry points + progress badge + adaptive polling |
-| `src/types.ts` | Cross-plane wire types (incl. `backfill` progress) |
+| `src/types.ts` | Cross-plane wire types (incl. `backfill` progress, `history` summary) |
+| `src/history.ts` | Historical-baseline parsing/validation |
+| `scripts/history/` | Baseline generator and the imported data copy |
 | `scripts/build-lib.mjs` | Generates `lib/` from `src/` (Node 24 type stripping, no DSH toolchain) |
 | `cordis.patch.yml` | Bundle patch: inserts the plugin row |
 | `lib/` | Committed build artifacts (runs as-is, no build needed) |
@@ -261,6 +309,9 @@ Consistent with DSH's built-in token-meter:
 ```sh
 node scripts/build-lib.mjs          # regenerate lib/types/*.js and lib/client.js
 node scripts/build-lib.mjs --check  # verify lib/ is in sync with src/
+
+# regenerate the historical baseline (writes to the DSH data dir + a repo copy)
+node scripts/history/build-baseline.mjs
 ```
 
 It uses Node 24's `module.stripTypeScriptTypes` for type-only compilation, so no DSH

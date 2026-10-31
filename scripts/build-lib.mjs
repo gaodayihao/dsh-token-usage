@@ -72,6 +72,11 @@ async function buildAggregate() {
   return js
 }
 
+async function buildHistory() {
+  const raw = await readSource('src/history.ts')
+  return banner(rewriteRelativeImports(cleanGenerated(stripTypes(raw, 'src/history.ts'))), 'src/history.ts')
+}
+
 async function buildTypes() {
   const raw = await readSource('src/types.ts')
   let js = cleanGenerated(stripTypes(raw, 'src/types.ts'))
@@ -116,6 +121,7 @@ async function buildClient() {
 const outputs = [
   ['lib/types/index.js', await buildHost()],
   ['lib/types/aggregate.js', await buildAggregate()],
+  ['lib/types/history.js', await buildHistory()],
   ['lib/types/types.js', await buildTypes()],
   ['lib/client.js', await buildClient()],
 ]

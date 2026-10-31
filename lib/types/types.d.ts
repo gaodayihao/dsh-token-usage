@@ -30,6 +30,14 @@ export interface BackfillProgress {
     coldReads: number;
     mode: 'projection' | 'fallback';
 }
+/** 已导入的历史基线摘要（面板据此显示“含导入历史”）。 */
+export interface HistoryBaselineInfo {
+    label: string;
+    range: [string, string];
+    totalTokens: number;
+    estimatedDaily: boolean;
+    importedAt: number;
+}
 /** getStats 快照：一次调用返回的全量聚合（Codex 个人用量页口径）。 */
 export interface TokenUsageSnapshot {
     totalConversations: number;
@@ -53,4 +61,5 @@ export interface TokenUsageSnapshot {
     latestDate: string;
     updatedAt: number;
     backfill: BackfillProgress;
+    history: HistoryBaselineInfo | null;
 }

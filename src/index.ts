@@ -28,11 +28,14 @@ import { Remote, TypertRemoteService } from '@deepseek-ai/dsh-typert-protocol'
 import type { Session, SessionEvent } from '@deepseek-ai/dsh-session'
 import type { SessionPersistence } from '@deepseek-ai/dsh-session-persistence'
 import { z } from 'zod'
+import { readFileSync, statSync } from 'node:fs'
 import { mkdir, readFile, rename, writeFile } from 'node:fs/promises'
 import { homedir } from 'node:os'
 import { dirname, join } from 'node:path'
 import { applySessionEvent, buildGlobalSnapshot, createSessionState, sessionView } from './aggregate.ts'
 import type { SessionUnitState, SessionView } from './aggregate.ts'
+import { parseHistoryBaseline } from './history.ts'
+import type { HistoryBaseline } from './history.ts'
 import type { BackfillProgress, TokenUsageSnapshot } from './types.ts'
 
 export type * from './types.ts'
@@ -53,6 +56,8 @@ const COLD_READ_CONCURRENCY = 2
 const SNAPSHOT_TTL_MS = 1000
 /** 等待 DSH 投影服务就绪的上限（毫秒），超时即走兜底模式。 */
 const SERVICE_WAIT_MS = 4000
+/** 历史基线文件的检查节流（毫秒）：文件 mtime 变化时热加载。 */
+const HISTORY_CHECK_MS = 5000
 /** 兜底模式：日志 revision 未变则跳过重读。 */
 const FALLBACK_STORE_VERSION = 1
 const FALLBACK_FLUSH_DELAY_MS = 2000
@@ -193,6 +198,11 @@ function fallbackStorePath(): string {
   return join(dshHome(), 'storages', 'dsh-token-usage', `session-rollup.v${FALLBACK_STORE_VERSION}.json`)
 }
 
+/** 历史基线文件（截图/外部记录补回的丢失时段）。删掉即回滚。 */
+function historyBaselinePath(): string {
+  return join(dshHome(), 'storages', 'dsh-token-usage', 'history-baseline.v1.json')
+}
+
 /** 兼容旧版持久化句柄的读取返回形状：对象 { events } 或直接事件数组。 */
 function eventsOf(result: unknown): SessionEvent[] {
   if (Array.isArray(result)) return result as SessionEvent[]
@@ -247,6 +257,11 @@ export class TokenUsageService extends TypertRemoteService {
   private persistPending = false
   private readonly disposers: Array<() => void> = []
   private readonly storePath: string
+  /** 历史基线（截图/外部记录补回的丢失时段），没有导入时为 null。 */
+  private history: HistoryBaseline | null = null
+  private historyMtime = -1
+  private historyCheckedAt = 0
+  private readonly historyPath: string
 
   /**
    * @param ctx - Host context carrying session persistence.
@@ -254,10 +269,12 @@ export class TokenUsageService extends TypertRemoteService {
   constructor(ctx: Context) {
     super(ctx, 'tokenUsage')
     this.storePath = fallbackStorePath()
+    this.historyPath = historyBaselinePath()
   }
 
   /** 挂载 live 订阅并后台启动 bootstrap（不阻塞插件激活）。 */
   protected async [Service.init](): Promise<void> {
+    this.refreshHistory(true)
     const sp = this.ctx.sessionPersistence as unknown as SessionPersistence | undefined
     const offLive = this.ctx.on('session/event', (session: Session, event: SessionEvent) => {
       this.onLiveEvent(session, event)
@@ -706,18 +723,56 @@ export class TokenUsageService extends TypertRemoteService {
   }
 
   /**
+   * 读取/热更新历史基线（截图或外部记录补回的丢失时段）。
+   * 文件不存在或损坏时静默清空，不影响真实统计；mtime 变化时热加载（不必重启）。
+   */
+  private refreshHistory(force: boolean): void {
+    const now = Date.now()
+    if (!force && now - this.historyCheckedAt < HISTORY_CHECK_MS) return
+    this.historyCheckedAt = now
+    try {
+      const stat = statSync(this.historyPath)
+      if (!force && stat.mtimeMs === this.historyMtime) return
+      const parsed = parseHistoryBaseline(JSON.parse(readFileSync(this.historyPath, 'utf8')) as unknown)
+      if (!parsed) {
+        if (this.history !== null) {
+          this.history = null
+          this.dirty = true
+        }
+        this.historyMtime = stat.mtimeMs
+        warn(`history baseline ignored (invalid schema): ${this.historyPath}`)
+        return
+      }
+      parsed.importedAt = parsed.importedAt ?? Math.round(stat.mtimeMs)
+      this.history = parsed
+      this.historyMtime = stat.mtimeMs
+      this.dirty = true
+      console.log(`[token-usage] history baseline loaded: ${parsed.label} (${parsed.range[0]} → ${parsed.range[1]}, ${parsed.totalTokens} tokens)`)
+    } catch (error) {
+      const missing = (error as { code?: string } | null)?.code === 'ENOENT'
+      if (!missing) warn(`history baseline read failed: ${error instanceof Error ? error.message : String(error)}`)
+      this.historyMtime = -1
+      if (this.history !== null) {
+        this.history = null
+        this.dirty = true
+      }
+    }
+  }
+
+  /**
    * 读取当前聚合快照。
    * @returns 全部 session 的 token 用量汇总（纯 JSON）。
    */
   @Remote('getStats')
   getStats(): TokenUsageSnapshot {
+    this.refreshHistory(false)
     const now = Date.now()
     if (this.cachedSnapshot === null || this.dirty || now - this.lastBuildAt >= SNAPSHOT_TTL_MS) {
       const progress: BackfillProgress = {
         ...this.progress,
         done: Math.min(this.progress.done, this.progress.total || this.progress.done),
       }
-      this.cachedSnapshot = buildGlobalSnapshot(this.views.values(), progress)
+      this.cachedSnapshot = buildGlobalSnapshot(this.views.values(), progress, this.history)
       this.dirty = false
       this.lastBuildAt = now
     }

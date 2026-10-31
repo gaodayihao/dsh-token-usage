@@ -25,11 +25,14 @@ import type {} from '@deepseek-ai/dsh-client-ui-layout/client'
 import type { SidebarFooterActionOwnerProps } from '@deepseek-ai/dsh-client-ui-sidebar/client'
 import type {} from '@deepseek-ai/dsh-client-ui-sidebar/client'
 import type {} from '@deepseek-ai/dsh-client-ui-conversation/client'
-import type { BackfillPhase, BackfillProgress, TokenUsageSnapshot } from '../types.ts'
+import type { BackfillPhase, BackfillProgress, HistoryBaselineInfo, TokenUsageSnapshot } from '../types.ts'
 
 /* ── backfill 进度（host 投影缓存 + 增量聚合的首次安装回填） ──────────────── */
-/** 兼容视图：backfill 在 wire 类型里必填，但旧 host / 旧快照可能整体缺失或只给部分字段。 */
-type SnapshotView = Omit<TokenUsageSnapshot, 'backfill'> & { backfill?: Partial<BackfillProgress> | null }
+/** 兼容视图：backfill/history 在 wire 类型里必填，但旧 host / 旧快照可能整体缺失。 */
+type SnapshotView = Omit<TokenUsageSnapshot, 'backfill' | 'history'> & {
+  backfill?: Partial<BackfillProgress> | null
+  history?: HistoryBaselineInfo | null
+}
 /** 回填进度缺省值：数据未到或老 host 不返回 backfill 时的兜底。 */
 const DEFAULT_BACKFILL: BackfillProgress = {
   phase: 'idle',
@@ -44,6 +47,12 @@ const BACKFILL_PHASES: BackfillPhase[] = ['idle', 'scanning', 'backfilling', 're
  * 读取快照里的回填进度：旧快照没有 backfill（或字段类型不符）时逐项回退到
  * 缺省值，保证面板 / 胶囊在纯老数据下照常渲染、不抛错。
  */
+function historyOf(s: TokenUsageSnapshot | null): HistoryBaselineInfo | null {
+  const raw = s ? (s as SnapshotView).history : null
+  if (!raw || typeof raw !== 'object' || !Array.isArray(raw.range)) return null
+  return raw
+}
+
 function backfillOf(s: TokenUsageSnapshot | null): BackfillProgress {
   const raw = s ? (s as SnapshotView).backfill : null
   if (!raw || typeof raw !== 'object') return { ...DEFAULT_BACKFILL }
@@ -435,6 +444,7 @@ const EMPTY_SNAPSHOT: TokenUsageSnapshot = {
   latestDate: '',
   updatedAt: 0,
   backfill: { ...DEFAULT_BACKFILL },
+  history: null,
 }
 
 /** 解析当前主题（面板与入口统一口径）。 */
@@ -619,10 +629,12 @@ function TokenStatsPanel(): React.ReactElement | null {
   // 老 host 不返回 backfill 时 backfillOf 逐项兜底，面板与胶囊都不崩。
   const s = data ?? EMPTY_SNAPSHOT
   const bf = backfillOf(data)
+  const hist = historyOf(data)
   const fetchedAt = new Date()
   const hm = String(fetchedAt.getHours()).padStart(2, '0')
   const mm = String(fetchedAt.getMinutes()).padStart(2, '0')
-  const userSub = `${s.earliestDate || '—'} → ${s.latestDate || '—'} · 更新于 ${hm}:${mm}`
+  const historyNote = hist ? ` · 含导入历史 ${hist.range[0]} → ${hist.range[1]}${hist.estimatedDaily ? '（估算）' : ''}` : ''
+  const userSub = `${s.earliestDate || '—'} → ${s.latestDate || '—'} · 更新于 ${hm}:${mm}${historyNote}`
 
   // 5 指标栏
   const metrics = h('div', { className: 'dts-metrics' },
@@ -662,6 +674,8 @@ function TokenStatsPanel(): React.ReactElement | null {
     ['工具调用总数', fmtInt(s.totalToolCalls ?? 0)],
     ['已探索工具', `${s.distinctTools ?? 0} 种`],
   ]
+  // 有历史基线导入时补一行溯源（估算的日分布会在这里标注）。
+  if (hist) insightRows.push(['历史导入', `${hist.range[0]} → ${hist.range[1]}${hist.estimatedDaily ? ' · 估算' : ''}`])
   const insight = h('div', { className: 'dts-col' },
     h('div', { className: 'dts-col-title' }, '活动洞察'),
     insightRows.map(([k, v]) => h('div', { className: 'insight-row', key: k },

@@ -2,7 +2,8 @@
  * 纯聚合模块类型声明（实现见 lib/types/aggregate.js）。
  * @module @deepseek-ai/dsh-token-usage/aggregate
  */
-import type { BackfillProgress, ThinkingLevelCounts, TokenUsageSnapshot } from './types.ts';
+import type { BackfillProgress, HistoryBaselineInfo, ThinkingLevelCounts, TokenUsageSnapshot } from './types.ts';
+import type { HistoryBaseline } from './history.ts';
 export interface TokenBuckets {
     inputTokens: number;
     outputTokens: number;
@@ -69,4 +70,5 @@ export declare function applySessionEvent(state: SessionUnitState, event: {
     data?: unknown;
 } | null | undefined): SessionUnitState;
 export declare function sessionView(state: SessionUnitState): SessionView;
-export declare function buildGlobalSnapshot(views: Iterable<SessionView>, progress: BackfillProgress): TokenUsageSnapshot;
+export declare function buildGlobalSnapshot(views: Iterable<SessionView>, progress: BackfillProgress, history?: HistoryBaseline | null): TokenUsageSnapshot;
+export type { HistoryBaselineInfo };

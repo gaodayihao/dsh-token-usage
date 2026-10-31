@@ -18,7 +18,8 @@
  * @module @deepseek-ai/dsh-token-usage/aggregate
  */
 
-import type { BackfillProgress, ThinkingLevelCounts, TokenUsageSnapshot } from './types.ts'
+import type { BackfillProgress, HistoryBaselineInfo, ThinkingLevelCounts, TokenUsageSnapshot } from './types.ts'
+import type { HistoryBaseline } from './history.ts'
 
 /** 四类 usage 桶（DSH TokenUsage 口径）。 */
 export interface TokenBuckets {
@@ -479,8 +480,19 @@ export function sessionView(state: SessionUnitState): SessionView {
   }
 }
 
-/** 合并多个会话视图为一个全局快照（与旧实现同口径 + 回填进度）。 */
-export function buildGlobalSnapshot(views: Iterable<SessionView>, progress: BackfillProgress): TokenUsageSnapshot {
+/**
+ * 合并多个会话视图 + 可选的历史基线为一个全局快照。
+ *
+ * 历史基线（`history`）是"已经丢失、只能从截图/外部记录补回"的时段汇总：
+ * 累计/峰值/会话/消息/工具/时长直接相加或取较大值，日桶按日期相加，
+ * 连续天数按合并后的活跃日期重算。基线没有提供的维度（thinking/模型明细）
+ * 沿用真实会话的分布。没有基线时行为与旧实现完全一致。
+ */
+export function buildGlobalSnapshot(
+  views: Iterable<SessionView>,
+  progress: BackfillProgress,
+  history?: HistoryBaseline | null,
+): TokenUsageSnapshot {
   const total = zeroBuckets()
   const daily = new Map<string, number>()
   const thinking: ThinkingLevelCounts = { high: 0, medium: 0, low: 0, off: 0 }
@@ -518,8 +530,51 @@ export function buildGlobalSnapshot(views: Iterable<SessionView>, progress: Back
     if (seg > maxDurationSec) maxDurationSec = seg
   }
 
-  const [currentStreak, longestStreak] = streakDays(sessionDates)
-  const sortedDates = sessionDates.sort()
+  // 真实会话的汇总先算出来：基线里的"工具调用总数 / skill 总数"是包含自身 Top 明细的
+  // 总量，不能和合并进 tools/skills 地图的次数重复相加。
+  const realToolCalls = sumValues(tools)
+  const realSkillUses = sumValues(skills)
+  const activeDates = [...sessionDates]
+  let historyInfo: HistoryBaselineInfo | null = null
+
+  if (history) {
+    for (const [day, value] of Object.entries(history.dailyTokens)) {
+      daily.set(day, (daily.get(day) ?? 0) + value)
+    }
+    if (history.thinkingLevels) {
+      thinking.high += history.thinkingLevels.high
+      thinking.medium += history.thinkingLevels.medium
+      thinking.low += history.thinkingLevels.low
+      thinking.off += history.thinkingLevels.off
+    }
+    for (const [key, value] of Object.entries(history.modelBreakdown ?? {})) {
+      models.set(key, (models.get(key) ?? 0) + value)
+    }
+    for (const [name, count] of history.topPlugins ?? []) tools.set(name, (tools.get(name) ?? 0) + count)
+    for (const [name, count] of history.topSkills ?? []) skills.set(name, (skills.get(name) ?? 0) + count)
+    sessions += history.totalConversations ?? 0
+    messages += history.totalMessages ?? 0
+    if ((history.peakTokens ?? 0) > peakTokens) peakTokens = history.peakTokens ?? 0
+    if ((history.maxDurationSec ?? 0) > maxDurationSec) maxDurationSec = history.maxDurationSec ?? 0
+    if (history.activeDates) activeDates.push(...history.activeDates)
+    historyInfo = {
+      label: history.label,
+      range: [history.range[0], history.range[1]],
+      totalTokens: history.totalTokens,
+      estimatedDaily: history.dailyEstimated,
+      importedAt: history.importedAt ?? 0,
+    }
+  }
+
+  let [currentStreak, longestStreak] = streakDays(activeDates)
+  if (history) {
+    if ((history.currentStreak ?? 0) > currentStreak) currentStreak = history.currentStreak ?? 0
+    if ((history.longestStreak ?? 0) > longestStreak) longestStreak = history.longestStreak ?? 0
+  }
+
+  const dateList = [...sessionDates]
+  if (history) dateList.push(history.range[0], history.range[1])
+  dateList.sort()
   const topPlugins: Array<[string, number]> = [...tools.entries()]
     .filter(([name]) => !CORE_TOOLS.has(name))
     .sort((a, b) => b[1] - a[1] || a[0].localeCompare(b[0]))
@@ -527,15 +582,11 @@ export function buildGlobalSnapshot(views: Iterable<SessionView>, progress: Back
   const topSkills: Array<[string, number]> = [...skills.entries()]
     .sort((a, b) => b[1] - a[1] || a[0].localeCompare(b[0]))
     .slice(0, 5)
-  let totalToolCalls = 0
-  for (const value of tools.values()) totalToolCalls += value
-  let totalSkillUses = 0
-  for (const value of skills.values()) totalSkillUses += value
 
   return {
     totalConversations: sessions,
     totalMessages: messages,
-    totalTokens: total.inputTokens + total.outputTokens + total.cacheReadTokens + total.cacheWriteTokens,
+    totalTokens: total.inputTokens + total.outputTokens + total.cacheReadTokens + total.cacheWriteTokens + (history?.totalTokens ?? 0),
     peakTokens,
     maxDurationSec,
     maxDurationText: fmtDuration(maxDurationSec),
@@ -543,16 +594,24 @@ export function buildGlobalSnapshot(views: Iterable<SessionView>, progress: Back
     longestStreak,
     dailyTokens: Object.fromEntries(daily),
     thinkingLevels: thinking,
-    totalToolCalls,
-    distinctTools: tools.size,
+    totalToolCalls: realToolCalls + (history?.totalToolCalls ?? 0),
+    distinctTools: Math.max(tools.size, history?.distinctTools ?? 0),
     topPlugins,
     topSkills,
-    totalSkillUses,
-    distinctSkills: skills.size,
+    totalSkillUses: realSkillUses + (history?.totalSkillUses ?? 0),
+    distinctSkills: Math.max(skills.size, history?.distinctSkills ?? 0),
     modelBreakdown: Object.fromEntries(models),
-    earliestDate: sortedDates[0] ?? '',
-    latestDate: sortedDates[sortedDates.length - 1] ?? '',
+    earliestDate: dateList[0] ?? '',
+    latestDate: dateList[dateList.length - 1] ?? '',
     updatedAt: Date.now(),
     backfill: { ...progress },
+    history: historyInfo,
   }
+}
+
+/** 求一个计数表的合计。 */
+function sumValues(map: Map<string, number>): number {
+  let total = 0
+  for (const value of map.values()) total += value
+  return total
 }

@@ -40,6 +40,20 @@ export interface BackfillProgress {
   mode: 'projection' | 'fallback'
 }
 
+/** 已导入的历史基线摘要（面板据此显示“含导入历史”）。 */
+export interface HistoryBaselineInfo {
+  /** 展示标签，例如“磁盘损坏前，按截图导入”。 */
+  label: string
+  /** 覆盖的日期范围 ['YYYY-MM-DD', 'YYYY-MM-DD']。 */
+  range: [string, string]
+  /** 该时段累计 token。 */
+  totalTokens: number
+  /** 每日数值是否为估算。 */
+  estimatedDaily: boolean
+  /** 导入时间（epoch ms）。 */
+  importedAt: number
+}
+
 /** getStats 快照：一次调用返回的全量聚合（Codex 个人用量页口径）。 */
 export interface TokenUsageSnapshot {
   /** 有历史记录的会话总数。 */
@@ -84,4 +98,6 @@ export interface TokenUsageSnapshot {
   updatedAt: number
   /** 历史回填进度（面板据此显示"统计中 x/y"）。 */
   backfill: BackfillProgress
+  /** 已导入的历史基线（没有导入时为 null）。 */
+  history: HistoryBaselineInfo | null
 }

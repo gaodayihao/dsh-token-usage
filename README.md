@@ -27,6 +27,8 @@ DSH 刚发布，大家最关心的就是：**我的 Token 到底花哪去了？*
   - 会话头部实时用量胶囊：`⚡ 2.61亿`（面板打开时 5 秒刷新，关闭时低频刷新）
 - **增量统计，冷启动零日志解压**：会话聚合持久化在 DSH 的投影缓存里，启动只读
   每个会话的缓存行；只有没缓存的会话才冷读一次原始日志，之后永久命中
+- **支持补回丢失历史**：日志被误删/磁盘损坏导致统计缺口时，可用「历史基线导入」
+  把截图/外部记录里的汇总并进面板（标注来源与估算，删文件即回滚）
 - **深空紫双主题**，跟随系统 / 手动切换
 
 ![入口位置：侧边栏底部按钮 + 会话头部 ⚡ 胶囊](./docs/screenshot-entries.png)
@@ -224,6 +226,49 @@ git 地址（`git+` / `github:` / `.git`）」—— 它是一条通用提示，
 - thinking 等级优先取 `request/header` 的 `reasoningEffort`（DSH 实际下发档位），
   没有该事件的旧日志才回退 `reasoningTokens` 近似；Skill 统计从 `skill` 工具调用参数解析
 
+## 补回丢失的历史（历史基线导入）
+
+如果一段时间的会话日志已经丢失（误删、磁盘损坏、换机），又想把那段 Token 统计
+补回面板，可以在 DSH 数据目录放一个**历史基线文件**：
+
+```
+~/.dsh/storages/dsh-token-usage/history-baseline.v1.json
+```
+
+插件启动后（以及文件 mtime 变化后 5 秒内）会加载它，并与真实会话汇总合并：
+
+- 累计 Token / 会话数 / 消息数 / 工具调用 / 峰值 / 最长时长：相加或取较大值；
+- 每日 token：按日期相加，热力图直接补出那段时间的颜色；
+- 连续天数：按"基线活跃日期 ∪ 真实会话日期"重新计算；
+- thinking / 模型明细：基线没有提供时沿用真实会话的分布。
+
+示例：
+
+```json
+{
+  "version": 1,
+  "label": "2026-08-26 ~ 2026-10-10（磁盘损坏前，按截图导入）",
+  "range": ["2026-08-26", "2026-10-10"],
+  "totalTokens": 42135000000,
+  "peakTokens": 2309000000,
+  "maxDurationSec": 35820,
+  "totalConversations": 1137,
+  "totalMessages": 153724,
+  "totalToolCalls": 194617,
+  "distinctTools": 228,
+  "topPlugins": [["pwsh", 49556], ["mcp__vs-mcp-ursa__FindSymbols", 5101]],
+  "dailyTokens": { "2026-08-26": 310000000, "2026-09-23": 2789000000 },
+  "dailyEstimated": true,
+  "activeDates": ["2026-08-31", "2026-09-01"]
+}
+```
+
+- 面板会在副标题和「活动洞察」里标注 `含导入历史 <起> → <止>（估算）`；
+- **删除这个文件即完全回滚**（免重启，5 秒内生效），不会影响真实会话与投影缓存；
+- 基线时段不要与真实数据重叠，否则会重复计数；
+- 本仓库的 `scripts/history/build-baseline.mjs` 是一个从截图还原基线的示例脚本
+  （本次用它还原了 2026-08-26 → 2026-10-10 的数据）。
+
 ## 架构
 
 ```
@@ -249,7 +294,9 @@ git 地址（`git+` / `github:` / `.git`）」—— 它是一条通用提示，
 | `src/index.ts` | Host 半边：投影单元注册 / 缓存读取 / 冷读回填 / 兜底持久化 + Typert Remote |
 | `src/aggregate.ts` | 纯聚合模块（不依赖 DSH 运行时）：`createSessionState` / `applySessionEvent` / `sessionView` / `buildGlobalSnapshot` |
 | `src/client/index.ts` | 浏览器半边：面板 UI + 两个入口 + 进度徽标 + 自适应轮询 |
-| `src/types.ts` | 跨平面 wire 类型（含 `backfill` 进度） |
+| `src/types.ts` | 跨平面 wire 类型（含 `backfill` 进度、`history` 基线摘要） |
+| `src/history.ts` | 历史基线解析/校验（截图或外部记录补回的丢失时段） |
+| `scripts/history/` | 历史基线生成脚本与本次导入的数据副本 |
 | `scripts/build-lib.mjs` | 从 `src/` 生成 `lib/`（Node 24 类型擦除，无需 DSH 工具链） |
 | `scripts/verify/` | 独立参考实现 + 全量日志对拍 + 加载冒烟 |
 | `cordis.patch.yml` | bundle patch：插入插件行 |
@@ -262,6 +309,9 @@ git 地址（`git+` / `github:` / `.git`）」—— 它是一条通用提示，
 ```sh
 node scripts/build-lib.mjs          # 重新生成 lib/types/*.js 与 lib/client.js
 node scripts/build-lib.mjs --check  # 只校验 lib/ 是否与 src/ 同步
+
+# 从截图数据重新生成历史基线（会写入 DSH 数据目录 + 仓库副本）
+node scripts/history/build-baseline.mjs
 ```
 
 它用 Node 24 内置的 `module.stripTypeScriptTypes` 做“只擦除类型”的等价编译，
