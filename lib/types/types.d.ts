@@ -51,6 +51,9 @@ export interface TokenUsageSnapshot {
     dailyTokens: Record<string, number>;
     thinkingLevels: ThinkingLevelCounts;
     totalToolCalls: number;
+    inlineToolCalls: number;
+    runCodeCalls: number;
+    toolErrors: number;
     distinctTools: number;
     topPlugins: Array<[string, number]>;
     topSkills: Array<[string, number]>;

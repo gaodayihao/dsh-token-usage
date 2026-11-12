@@ -52,10 +52,16 @@ export interface SessionUnitState {
   thinking: ThinkingLevelCounts
   /** 模型族 -> 结算次数。 */
   models: Record<string, number>
-  /** 工具名 -> 调用次数。 */
+  /** 工具名 -> 顶层调用次数。 */
   tools: Record<string, number>
+  /** run_code 内联（PTC）真实工具名 -> 调用次数。 */
+  inline: Record<string, number>
+  /** 内联调用失败次数（按工具名，isError=true）。 */
+  inlineErrors: Record<string, number>
   /** skill 名 -> 使用次数。 */
   skills: Record<string, number>
+  /** fork 继承的事件前缀长度：折叠时跳过 seq 小于它的继承事件，避免重复计数。 */
+  inheritedEventCount: number
   messageCount: number
   lastMsgTime: number | null
   segStart: number | null
@@ -81,6 +87,8 @@ export interface SessionView {
   thinking: ThinkingLevelCounts
   models: Record<string, number>
   tools: Record<string, number>
+  inline: Record<string, number>
+  inlineErrors: Record<string, number>
   skills: Record<string, number>
   messageCount: number
   lastMsgTime: number | null
@@ -88,8 +96,15 @@ export interface SessionView {
   maxSeg: number
 }
 
-/** DSH 核心工具集：其余工具视为“插件”。 */
+/**
+ * DSH 核心工具集 / 调度壳：其余工具视为“插件”。
+ *
+ * `run_code` 是 PTC 运行时外壳——模型只能直接调它，真正的工具调用记录在
+ * `tool/ptc-dispatch*` 事件里（聚合进 `inline`）。所以它既不进插件榜，
+ * 也不计入“已探索工具”。
+ */
 export const CORE_TOOLS = new Set([
+  'run_code',
   'bash', 'read', 'read_image', 'write', 'edit', 'glob', 'grep', 'todo_write', 'ask_user_question',
   'subagent', 'subagent_fork', 'interrupt_agent', 'list_agents', 'send_message',
   'job_kill', 'job_list', 'job_output',
@@ -266,7 +281,10 @@ function usageOf(event: { type: string; data?: unknown }): unknown {
 }
 
 /** 会话元数据骨架。 */
-export function createSessionState(header?: { createdAt?: unknown } | null): SessionUnitState {
+export function createSessionState(
+  header?: { createdAt?: unknown } | null,
+  inheritedEventCount = 0,
+): SessionUnitState {
   return {
     createdAt: num(header?.createdAt),
     inputTokens: 0,
@@ -277,7 +295,10 @@ export function createSessionState(header?: { createdAt?: unknown } | null): Ses
     thinking: { high: 0, medium: 0, low: 0, off: 0 },
     models: {},
     tools: {},
+    inline: {},
+    inlineErrors: {},
     skills: {},
+    inheritedEventCount: num(inheritedEventCount),
     messageCount: 0,
     lastMsgTime: null,
     segStart: null,
@@ -375,11 +396,18 @@ function settle(
 }
 
 /** 折叠一条 session 事件，返回新状态（纯函数；未变化的事件返回原 state 引用）。 */
-export function applySessionEvent(state: SessionUnitState, event: { type?: unknown; time?: unknown; data?: unknown } | null | undefined): SessionUnitState {
+export function applySessionEvent(
+  state: SessionUnitState,
+  event: { type?: unknown; time?: unknown; seq?: unknown; data?: unknown } | null | undefined,
+): SessionUnitState {
   if (!event || typeof event.type !== 'string') return state
   const type = event.type
   const data = (event.data ?? {}) as Record<string, unknown>
   const time = num(event.time)
+  // fork 出来的子会话日志带着父会话的继承前缀（seq 从 0 开始重放）。跳过这段，
+  // 否则同一笔调用会被父子两个会话各记一次（token 口径同理）。
+  const seq = event.seq
+  if (typeof seq === 'number' && seq < state.inheritedEventCount) return state
 
   if (type === 'request/header') {
     const header = data.header as { config?: { reasoningEffort?: unknown } } | undefined
@@ -456,6 +484,27 @@ export function applySessionEvent(state: SessionUnitState, event: { type?: unkno
     return { ...state, tools: incr(state.tools, name), skills }
   }
 
+  // run_code 内联调用：PTC 运行时每次 `tools.xxx()` 的发起事件。
+  // 这是"真实工具调用"的权威来源（顶层 tool/call 只会记到 run_code 名下）。
+  if (type === 'tool/ptc-dispatch-start') {
+    const name = data.name
+    if (typeof name !== 'string' || !name) return state
+    let skills = state.skills
+    if (name === 'skill') {
+      // 内联事件的 arguments 已经是对象（顶层 tool/call 才是 JSON 字符串）。
+      const args = data.arguments as { name?: unknown } | null | undefined
+      if (args && typeof args.name === 'string' && args.name) skills = incr(skills, args.name)
+    }
+    return { ...state, inline: incr(state.inline, name), skills }
+  }
+
+  // 内联完成事件：只用来记失败次数（是否失败以 isError 为准）。
+  if (type === 'tool/ptc-dispatch') {
+    const name = data.name
+    if (data.isError !== true || typeof name !== 'string' || !name) return state
+    return { ...state, inlineErrors: incr(state.inlineErrors, name) }
+  }
+
   return state
 }
 
@@ -472,6 +521,8 @@ export function sessionView(state: SessionUnitState): SessionView {
     thinking: { ...state.thinking },
     models: { ...state.models },
     tools: { ...state.tools },
+    inline: { ...state.inline },
+    inlineErrors: { ...state.inlineErrors },
     skills: { ...state.skills },
     messageCount: state.messageCount,
     lastMsgTime: state.lastMsgTime,
@@ -497,8 +548,12 @@ export function buildGlobalSnapshot(
   const daily = new Map<string, number>()
   const thinking: ThinkingLevelCounts = { high: 0, medium: 0, low: 0, off: 0 }
   const models = new Map<string, number>()
+  /** 顶层 tool/call 的工具名计数（含 run_code）。 */
   const tools = new Map<string, number>()
+  /** run_code 内联（PTC）真实工具名计数。 */
+  const inline = new Map<string, number>()
   const skills = new Map<string, number>()
+  let inlineErrors = 0
   const sessionDates: string[] = []
   let sessions = 0
   let messages = 0
@@ -520,6 +575,8 @@ export function buildGlobalSnapshot(
     thinking.off += view.thinking.off
     for (const [key, value] of Object.entries(view.models)) models.set(key, (models.get(key) ?? 0) + value)
     for (const [key, value] of Object.entries(view.tools)) tools.set(key, (tools.get(key) ?? 0) + value)
+    for (const [key, value] of Object.entries(view.inline ?? {})) inline.set(key, (inline.get(key) ?? 0) + value)
+    for (const value of Object.values(view.inlineErrors ?? {})) inlineErrors += value
     for (const [key, value] of Object.entries(view.skills)) skills.set(key, (skills.get(key) ?? 0) + value)
     if (view.createdAt) sessionDates.push(dayKey(view.createdAt))
     let seg = view.maxSeg
@@ -532,7 +589,10 @@ export function buildGlobalSnapshot(
 
   // 真实会话的汇总先算出来：基线里的"工具调用总数 / skill 总数"是包含自身 Top 明细的
   // 总量，不能和合并进 tools/skills 地图的次数重复相加。
-  const realToolCalls = sumValues(tools)
+  // 工具口径：run_code 只是 PTC 调度壳，真实调用 = 顶层工具调用 - run_code + 内联调用。
+  const runCodeCalls = tools.get('run_code') ?? 0
+  const inlineCalls = sumValues(inline)
+  const realToolCalls = sumValues(tools) - runCodeCalls + inlineCalls
   const realSkillUses = sumValues(skills)
   const activeDates = [...sessionDates]
   let historyInfo: HistoryBaselineInfo | null = null
@@ -575,7 +635,15 @@ export function buildGlobalSnapshot(
   const dateList = [...sessionDates]
   if (history) dateList.push(history.range[0], history.range[1])
   dateList.sort()
-  const topPlugins: Array<[string, number]> = [...tools.entries()]
+  // 插件榜按真实调用合并：顶层调用 + run_code 内联（同名工具相加）；
+  // run_code 落在 CORE_TOOLS 里，因此不会出现在榜单上，只通过 runCodeCalls 单列。
+  const pluginCounts = new Map<string, number>(tools)
+  for (const [name, count] of inline) pluginCounts.set(name, (pluginCounts.get(name) ?? 0) + count)
+  const distinctTools = Math.max(
+    [...pluginCounts.keys()].filter(name => name !== 'run_code').length,
+    history?.distinctTools ?? 0,
+  )
+  const topPlugins: Array<[string, number]> = [...pluginCounts.entries()]
     .filter(([name]) => !CORE_TOOLS.has(name))
     .sort((a, b) => b[1] - a[1] || a[0].localeCompare(b[0]))
     .slice(0, 5)
@@ -595,7 +663,10 @@ export function buildGlobalSnapshot(
     dailyTokens: Object.fromEntries(daily),
     thinkingLevels: thinking,
     totalToolCalls: realToolCalls + (history?.totalToolCalls ?? 0),
-    distinctTools: Math.max(tools.size, history?.distinctTools ?? 0),
+    inlineToolCalls: inlineCalls,
+    runCodeCalls,
+    toolErrors: inlineErrors,
+    distinctTools,
     topPlugins,
     topSkills,
     totalSkillUses: realSkillUses + (history?.totalSkillUses ?? 0),

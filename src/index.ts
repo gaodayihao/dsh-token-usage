@@ -48,8 +48,11 @@ declare module '@deepseek-ai/cordis' {
 
 /** 投影单元 key（持久化在 session_projcache 的每会话记录里）。 */
 const UNIT_KEY = 'dtsUsage'
-/** 投影单元状态版本：折叠语义变化时 +1，旧行会被 DSH 视为不可用并重折。 */
-const UNIT_VERSION = 1
+/**
+ * 投影单元状态版本：折叠语义变化时 +1，旧行会被 DSH 视为不可用并重折。
+ * v2：纳入 run_code 内联调用（tool/ptc-dispatch*）+ 跳过 fork 继承前缀。
+ */
+const UNIT_VERSION = 2
 /** 冷读日志时的并发度（单个大日志解压后几十 MB，别开太大）。 */
 const COLD_READ_CONCURRENCY = 2
 /** getStats 快照最短重算间隔（毫秒）。 */
@@ -58,8 +61,8 @@ const SNAPSHOT_TTL_MS = 1000
 const SERVICE_WAIT_MS = 4000
 /** 历史基线文件的检查节流（毫秒）：文件 mtime 变化时热加载。 */
 const HISTORY_CHECK_MS = 5000
-/** 兜底模式：日志 revision 未变则跳过重读。 */
-const FALLBACK_STORE_VERSION = 1
+/** 兜底模式：日志 revision 未变则跳过重读；折叠语义变化时 +1（旧 rollup 作废重扫）。 */
+const FALLBACK_STORE_VERSION = 2
 const FALLBACK_FLUSH_DELAY_MS = 2000
 
 /* ── 投影单元 schema（plain JSON，可被 DSH 持久化校验） ─────────────────── */
@@ -95,6 +98,12 @@ const unitStateSchema = z.object({
   maxSeg: z.number(),
   effort: z.string().nullable(),
   effortKnown: z.boolean(),
+  /** run_code 内联（PTC）真实工具名 -> 调用次数。 */
+  inline: z.record(z.string(), z.number()),
+  /** 内联调用失败次数（isError）。 */
+  inlineErrors: z.record(z.string(), z.number()),
+  /** fork 继承前缀长度（折叠时跳过）。 */
+  inheritedEventCount: z.number(),
   early: thinkingSchema,
   last: z.object({
     turn: z.number(),
@@ -121,6 +130,10 @@ const unitViewSchema = z.object({
   lastMsgTime: z.number().nullable(),
   segStart: z.number().nullable(),
   maxSeg: z.number(),
+  /** run_code 内联（PTC）真实工具名 -> 调用次数。 */
+  inline: z.record(z.string(), z.number()),
+  /** 内联调用失败次数（isError）。 */
+  inlineErrors: z.record(z.string(), z.number()),
 })
 
 /* ── DSH 服务的结构化视图（只用到的方法，避免硬依赖内部类型包） ─────────── */
@@ -393,7 +406,9 @@ export class TokenUsageService extends TypertRemoteService {
       key: UNIT_KEY,
       stateVersion: UNIT_VERSION,
       stateSchema: unitStateSchema,
-      init: (header: { createdAt?: number } | undefined) => createSessionState(header),
+      // 第二个参数是 DSH 传入的 fork 继承前缀长度；折叠时跳过这段，避免重复计数。
+      init: (header: { createdAt?: number } | undefined, inheritedEventCount?: unknown) =>
+        createSessionState(header, typeof inheritedEventCount === 'number' ? inheritedEventCount : 0),
       apply: (state: SessionUnitState, event: SessionEvent) => applySessionEvent(state, event),
       wire: {
         viewSchema: unitViewSchema,
@@ -522,7 +537,7 @@ export class TokenUsageService extends TypertRemoteService {
         return
       }
       // 兜底：本地折叠（写回失败/非投影模式时也保证数字正确）。
-      let state = createSessionState(header)
+      let state = createSessionState(header, inherited)
       for (const event of events) state = applySessionEvent(state, event)
       this.views.set(id, sessionView(state))
       this.states.set(id, state)
@@ -637,7 +652,8 @@ export class TokenUsageService extends TypertRemoteService {
     try {
       const events = eventsOf(await handle.read(0))
       const resolvedHeader = (handle.header ?? header) as { createdAt?: number } | undefined
-      let state = createSessionState(resolvedHeader)
+      const inherited = typeof handle.inheritedEventCount === 'number' ? handle.inheritedEventCount : 0
+      let state = createSessionState(resolvedHeader, inherited)
       for (const event of events) state = applySessionEvent(state, event)
       this.states.set(id, state)
       this.foldedSeq.set(id, events.length > 0 ? num(events[events.length - 1]?.seq) : -1)

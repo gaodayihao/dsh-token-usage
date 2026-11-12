@@ -21,7 +21,8 @@ DSH 刚发布，大家最关心的就是：**我的 Token 到底花哪去了？*
 
 - **5 大指标**：累计 / 单会话峰值 Token、最长聊天时长、当前 / 最长连续天数
 - **Token 活动热力图**：每日（GitHub 贡献图）/ 每周（柱状）/ 累计（折线）三视图，悬浮看数值
-- **活动洞察（含最常用模型）+ 插件 / Skill Top5**：谁在消耗最多，一目了然
+- **活动洞察（含最常用模型）+ 插件 Top5 / Skill Top5 分栏**：谁在消耗最多，一目了然
+  （插件榜统计的是真实工具调用：顶层调用 + `run_code` 内联，外壳 `run_code` 不再霸榜）
 - **两个原生入口**，与 DSH UI 融为一体：
   - 侧边栏底部「Token 统计」按钮（应用级常驻）
   - 会话头部实时用量胶囊：`⚡ 2.61亿`（面板打开时 5 秒刷新，关闭时低频刷新）
@@ -225,6 +226,9 @@ git 地址（`git+` / `github:` / `.git`）」—— 它是一条通用提示，
 - 累计 Token = input + output + cacheRead + cacheWrite
 - thinking 等级优先取 `request/header` 的 `reasoningEffort`（DSH 实际下发档位），
   没有该事件的旧日志才回退 `reasoningTokens` 近似；Skill 统计从 `skill` 工具调用参数解析
+- 工具调用口径：顶层 `tool/call`（去掉 PTC 外壳 `run_code`）+ `run_code` 内联调用
+  （`tool/ptc-dispatch-start`，即代码里每次 `tools.xxx()` 的真实调用）；
+  失败次数取 `tool/ptc-dispatch` 的 `isError`；fork 子会话跳过继承前缀，不重复计数
 
 ## 补回丢失的历史（历史基线导入）
 

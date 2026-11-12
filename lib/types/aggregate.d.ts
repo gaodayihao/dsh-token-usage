@@ -27,7 +27,10 @@ export interface SessionUnitState {
     thinking: ThinkingLevelCounts;
     models: Record<string, number>;
     tools: Record<string, number>;
+    inline: Record<string, number>;
+    inlineErrors: Record<string, number>;
     skills: Record<string, number>;
+    inheritedEventCount: number;
     messageCount: number;
     lastMsgTime: number | null;
     segStart: number | null;
@@ -48,6 +51,8 @@ export interface SessionView {
     thinking: ThinkingLevelCounts;
     models: Record<string, number>;
     tools: Record<string, number>;
+    inline: Record<string, number>;
+    inlineErrors: Record<string, number>;
     skills: Record<string, number>;
     messageCount: number;
     lastMsgTime: number | null;
@@ -63,10 +68,11 @@ export declare function fmtDuration(sec: number): string;
 export declare function streakDays(dateStrings: readonly string[]): [number, number];
 export declare function createSessionState(header?: {
     createdAt?: unknown;
-} | null): SessionUnitState;
+} | null, inheritedEventCount?: number): SessionUnitState;
 export declare function applySessionEvent(state: SessionUnitState, event: {
     type?: unknown;
     time?: unknown;
+    seq?: unknown;
     data?: unknown;
 } | null | undefined): SessionUnitState;
 export declare function sessionView(state: SessionUnitState): SessionView;

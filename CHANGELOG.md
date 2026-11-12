@@ -1,5 +1,34 @@
 # Changelog
 
+## [0.4.0] - 2026-11-12
+
+把 `run_code` 内部的内联工具调用拆出来统计：插件榜不再被 `$run_code` 霸榜。
+
+### Added
+
+- **内联调用统计**：折叠 `tool/ptc-dispatch-start` / `tool/ptc-dispatch`，按真实工具名
+  计数（`tools.skill()` 的 skill 名也一并解析）；快照新增 `inlineToolCalls` /
+  `runCodeCalls` / `toolErrors` 三个字段。
+- **插件 / Skill 分栏**：面板底部由"插件 + Skill 合并 Top5"改为两栏各自 Top5，
+  避免 skill 被插件次数挤没。
+- `scripts/verify/tools.mjs`：全量工具口径对拍（父会话前缀匹配求 fork 继承前缀、
+  合并历史基线，输出真实口径排行榜）。
+
+### Changed
+
+- **工具调用总数改为真实口径**：顶层工具调用 - `run_code` + 内联调用。
+  `run_code` 移入 `CORE_TOOLS`，不再出现在插件榜和"已探索工具"里，
+  只作为 `runCodeCalls`（批次）在洞察栏单列。
+- **fork 子会话去重**：折叠时跳过 `seq < inheritedEventCount` 的继承前缀。
+  此前父子会话各记一份，工具计数偏大（约 3%），token 口径同样受影响。
+- 投影单元 `UNIT_VERSION` 1→2、兜底 rollup `FALLBACK_STORE_VERSION` 1→2：
+  升级后首次启动会重新回填一次（面板显示"统计中 x/y"）。
+
+### Notes
+
+- 历史基线的 `totalToolCalls` 是旧口径（顶层调用）；该时段早于 PTC，没有内联调用，
+  直接相加不会重复计数。
+
 ## [0.3.1] - 2026-10-31
 
 支持"历史基线导入"：把磁盘损坏等原因丢失、只能从截图/外部记录补回的时段，

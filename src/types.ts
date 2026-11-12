@@ -76,9 +76,15 @@ export interface TokenUsageSnapshot {
   dailyTokens: Record<string, number>
   /** 推理强度档位计数。 */
   thinkingLevels: ThinkingLevelCounts
-  /** 工具调用总数。 */
+  /** 工具调用总数（顶层真实调用 + run_code 内联，不含 run_code 这个调度壳）。 */
   totalToolCalls: number
-  /** 出现过的工具种类数。 */
+  /** run_code 内联（PTC）真实工具调用次数。 */
+  inlineToolCalls: number
+  /** 顶层 run_code 调用次数（批处理批次）。 */
+  runCodeCalls: number
+  /** 内联调用失败次数（tool/ptc-dispatch 的 isError）。 */
+  toolErrors: number
+  /** 出现过的工具种类数（含内联调用；不含 run_code）。 */
   distinctTools: number
   /** 非核心工具（视为插件）Top5：[名称, 次数]。 */
   topPlugins: Array<[string, number]>

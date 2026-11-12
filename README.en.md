@@ -21,7 +21,9 @@ This plugin adds a token-usage stats panel to the DSH web UI, aggregating token 
 
 - **5 headline metrics**: total / per-session peak tokens, longest chat duration, current / longest streak
 - **Token activity heatmap**: daily (GitHub contribution graph) / weekly (bars) / cumulative (line) views with hover tooltips
-- **Activity insights (incl. top model) + top 5 plugins / skills**: see who is burning the most at a glance
+- **Activity insights (incl. top model) + top 5 plugins / top 5 skills**: see who is burning the most
+  at a glance (the plugin ranking counts real tool calls — direct calls plus `run_code` inline
+  dispatches — so the `run_code` shell no longer dominates)
 - **Two native entry points**, blended into the DSH UI:
   - "Token 统计" button at the bottom of the sidebar (always available)
   - Live usage capsule in the session header: `⚡ 2.61亿` (5s while the panel is open, low-frequency when closed)
@@ -225,6 +227,10 @@ Consistent with DSH's built-in token-meter:
 - Thinking level prefers `request/header`'s `reasoningEffort` (the level DSH actually sent) and
   falls back to a `reasoningTokens` approximation only for old logs without that event; skill
   stats are parsed from `skill` tool call arguments
+- Tool-call accounting: top-level `tool/call` minus the PTC shell `run_code`, plus `run_code`
+  inline dispatches (`tool/ptc-dispatch-start`, i.e. every real `tools.xxx()` call in the code);
+  failures come from `tool/ptc-dispatch.isError`; seeded forks skip their inherited prefix so
+  the same call is not counted twice
 
 ## Recovering lost history (historical baseline import)
 

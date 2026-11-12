@@ -147,7 +147,9 @@ const SCALAR_FIELDS = [
   'inputTokens', 'outputTokens', 'cacheReadTokens', 'cacheWriteTokens', 'totalTokens',
   'messageCount', 'maxSeg', 'createdAt',
 ]
-const MAP_FIELDS = ['days', 'thinking', 'models', 'tools', 'skills']
+// 工具 / skill 口径在 0.4.0 起改为"顶层调用 + run_code 内联"，旧实现只数顶层，
+// 两边语义不同，因此不再对拍（工具口径改用 scripts/verify/tools.mjs 单独验收）。
+const MAP_FIELDS = ['days', 'thinking', 'models']
 
 const oldAgg = new OldAggregator()
 const newViews = []
@@ -211,8 +213,7 @@ const newGlobal = buildGlobalSnapshot(newViews, progress)
 // 全局对拍
 const GLOBAL_SCALARS = [
   'totalConversations', 'totalMessages', 'totalTokens', 'peakTokens', 'maxDurationSec',
-  'currentStreak', 'longestStreak', 'totalToolCalls', 'distinctTools',
-  'totalSkillUses', 'distinctSkills', 'earliestDate', 'latestDate', 'maxDurationText',
+  'currentStreak', 'longestStreak', 'earliestDate', 'latestDate', 'maxDurationText',
 ]
 const globalDiffs = []
 for (const f of GLOBAL_SCALARS) {
@@ -224,14 +225,7 @@ const thinkingDiff = diffMaps(oldGlobal.thinkingLevels, newGlobal.thinkingLevels
 if (thinkingDiff.length) globalDiffs.push(['thinkingLevels', thinkingDiff])
 const modelDiff = diffMaps(oldGlobal.modelBreakdown, newGlobal.modelBreakdown)
 if (modelDiff.length) globalDiffs.push(['modelBreakdown', modelDiff])
-const topPluginsOld = Object.fromEntries(oldGlobal.topPlugins)
-const topPluginsNew = Object.fromEntries(newGlobal.topPlugins)
-const tpDiff = diffMaps(topPluginsOld, topPluginsNew)
-if (tpDiff.length) globalDiffs.push(['topPlugins', tpDiff, oldGlobal.topPlugins, newGlobal.topPlugins])
-const topSkillsOld = Object.fromEntries(oldGlobal.topSkills)
-const topSkillsNew = Object.fromEntries(newGlobal.topSkills)
-const tsDiff = diffMaps(topSkillsOld, topSkillsNew)
-if (tsDiff.length) globalDiffs.push(['topSkills', tsDiff, oldGlobal.topSkills, newGlobal.topSkills])
+// topPlugins / topSkills 不再对拍：0.4.0 起口径包含 run_code 内联调用。
 
 // 归因分类
 function classify(diag, field) {
